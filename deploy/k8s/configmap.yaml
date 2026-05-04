@@ -1,0 +1,35 @@
+---
+# Baseline agent config used by the DaemonSet.  Replace
+# <SERVER_URL> with the externally-reachable SimpleSIEM server URL
+# before applying.  The PSK is read from the simplesiem-enrol secret
+# at runtime (see daemonset.yaml).
+#
+# Watch paths point at the /host/* mounts the DaemonSet sets up so the
+# agent observes the *node's* filesystem rather than its own container
+# rootfs.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: simplesiem-config
+data:
+  config.json: |
+    {
+      "mode": "agent",
+      "agent": {
+        "server_url": "<SERVER_URL>",
+        "id": "${SIMPLESIEM_AGENT_ID}",
+        "enrol_key_env": "SIMPLESIEM_ENROL_KEY"
+      },
+      "log_dir": "/var/log/simplesiem",
+      "state_dir": "/var/lib/simplesiem",
+      "auth_log_paths": [
+        "/host/var/log/auth.log",
+        "/host/var/log/secure"
+      ],
+      "watch_paths": [
+        "/host/etc",
+        "/host/tmp"
+      ],
+      "process_interval": 5,
+      "auth_log_interval": 2
+    }

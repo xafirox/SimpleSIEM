@@ -1,0 +1,87 @@
+---
+# Ansible playbook for fleet-installing SimpleSIEM agents that report
+# to a central server.
+#
+# Usage:
+#   ansible-playbook -i inventory.ini deploy/ansible/playbook.yml \
+#       -e simplesiem_server_url=https://siem.example.com:9443 \
+#       -e simplesiem_enrol_key=$(ssh siem 'sudo simplesiem certs psk show')
+#
+# The `simplesiem_enrol_key` should be the *current* PSK printed by
+# `simplesiem certs psk show` on the server; rotate it after each fleet
+# join with `simplesiem certs psk rotate`.
+#
+# Idempotent: re-running against a host that's already enrolled is a
+# no-op (the install marker short-circuits). To re-enrol after a key
+# rotation, run with -e simplesiem_force_reenrol=true.
+
+- name: Install SimpleSIEM agents
+  hosts: simplesiem_agents
+  become: yes
+  vars:
+    simplesiem_binary_src: "{{ playbook_dir }}/../../dist/simplesiem-{{ ansible_system | lower }}-{{ ansible_architecture }}"
+    simplesiem_install_dir: /usr/local/bin
+    simplesiem_config_dir: /etc/simplesiem
+    simplesiem_log_dir: /var/log/simplesiem
+    simplesiem_state_dir: /var/lib/simplesiem
+    simplesiem_force_reenrol: false
+    simplesiem_realm: ""
+
+  pre_tasks:
+    - name: Verify required vars are set
+      assert:
+        that:
+          - simplesiem_server_url | length > 0
+          - simplesiem_enrol_key | length > 0
+        fail_msg: "Pass simplesiem_server_url and simplesiem_enrol_key on the command line (-e ...) or in group_vars."
+
+  tasks:
+    - name: Check if the agent is already installed
+      stat:
+        path: "{{ simplesiem_state_dir }}/.installed"
+      register: simplesiem_installed_marker
+
+    - name: Skip installed hosts unless forced
+      meta: end_host
+      when:
+        - simplesiem_installed_marker.stat.exists
+        - not simplesiem_force_reenrol
+
+    - name: Ensure parent directories exist
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ simplesiem_config_dir }}"
+        - "{{ simplesiem_log_dir }}"
+        - "{{ simplesiem_state_dir }}"
+
+    - name: Copy the simplesiem binary
+      copy:
+        src: "{{ simplesiem_binary_src }}"
+        dest: "{{ simplesiem_install_dir }}/simplesiem"
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Run simplesiem install (agent mode)
+      command: >
+        {{ simplesiem_install_dir }}/simplesiem install
+        --mode agent
+        --server {{ simplesiem_server_url | quote }}
+        --key {{ simplesiem_enrol_key | quote }}
+        --id {{ inventory_hostname | quote }}
+        {% if simplesiem_realm %}--realm {{ simplesiem_realm | quote }}{% endif %}
+      args:
+        creates: "{{ simplesiem_state_dir }}/.installed"
+
+    - name: Confirm the service is up
+      command: "{{ simplesiem_install_dir }}/simplesiem status --json"
+      register: simplesiem_status
+      changed_when: false
+      retries: 6
+      delay: 5
+      until: simplesiem_status.rc == 0

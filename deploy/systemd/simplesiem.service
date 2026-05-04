@@ -1,0 +1,46 @@
+[Unit]
+Description=SimpleSIEM on-box SIEM
+Documentation=https://github.com/OTA-Jake/LogServer
+After=network.target
+Wants=network-online.target
+
+# This is the same unit `simplesiem install` writes when systemd is
+# detected; it is published here so operators who manage their own
+# /etc/systemd/system tree (Ansible, Puppet, Salt, image bake) can ship
+# the file directly without invoking the install command.
+#
+# Hardening notes (see internal/sieg/service_unix.go::systemdTpl for the
+# in-tree authority):
+#   - PrivateTmp is intentionally NOT set — FileCollector watches /tmp.
+#   - ProtectHome=read-only (not =true) — /home is in the default watch list.
+#   - RestrictAddressFamilies includes AF_NETLINK — gopsutil reads sockets.
+#   - SystemCallFilter blocks @privileged @resources by negation.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/simplesiem run --config /etc/simplesiem/config.json
+Restart=on-failure
+RestartSec=5
+User=root
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+SystemCallFilter=@system-service @network-io @file-system
+SystemCallFilter=~@privileged @resources
+
+[Install]
+WantedBy=multi-user.target
