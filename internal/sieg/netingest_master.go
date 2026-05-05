@@ -125,12 +125,29 @@ func (a *masterNetworkIngestAdapter) fanoutAllowlist(store *networkAllowlist, ex
 		Entries       []networkSource `json:"entries"`
 		FromPeer      string          `json:"from_peer"`
 	}{cfgVer, entries, masterID(a.cfg)}
+	failed := []string{}
 	for _, srv := range a.cfg.Master.Servers {
 		host := serverHostFromURL(srv)
 		if host == excluding {
 			continue
 		}
-		_ = postJSONFromMaster(a.cfg, srv, "/v1/master/network-allowlist", body)
+		if err := postJSONFromMaster(a.cfg, srv, "/v1/master/network-allowlist", body); err != nil {
+			failed = append(failed, host)
+			if a.masterStore != nil {
+				a.masterStore.Write("errors", map[string]any{
+					"collector": "network_allowlist_fanout",
+					"server":    host,
+					"error":     err.Error(),
+				})
+			}
+		}
+	}
+	if len(failed) > 0 && a.masterStore != nil {
+		a.masterStore.Write("meta", map[string]any{
+			"event":         "network_allowlist_fanout_partial",
+			"failed_peers":  failed,
+			"hint":          "the next master sync tick will retry; or run `simplesiem network-source resync` on the affected servers",
+		})
 	}
 }
 

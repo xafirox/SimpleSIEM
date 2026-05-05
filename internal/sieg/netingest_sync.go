@@ -231,7 +231,10 @@ func realPostJSONToMaster(cfg Config, base, path string, body any) error {
 	}
 	defer resp.Body.Close()
 	if !httpStatusOK(resp.StatusCode) {
-		body, _ := io.ReadAll(resp.Body)
+		// LimitReader caps how much error-body we'll buffer in memory.
+		// A misbehaving / hostile peer could otherwise stream MBs of
+		// junk that we'd quote in an error string.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil
@@ -257,7 +260,10 @@ func realPostJSONFromMaster(cfg Config, base, path string, body any) error {
 	}
 	defer resp.Body.Close()
 	if !httpStatusOK(resp.StatusCode) {
-		body, _ := io.ReadAll(resp.Body)
+		// LimitReader caps how much error-body we'll buffer in memory.
+		// A misbehaving / hostile peer could otherwise stream MBs of
+		// junk that we'd quote in an error string.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return nil

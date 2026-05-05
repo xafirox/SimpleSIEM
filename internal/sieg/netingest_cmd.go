@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -457,8 +458,35 @@ func saveJSONFile(path string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	// Unique tmp per call — guards against the same shared-tmp race
+	// fixed in saveNetworkAllowlistFile.
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	defer func() {
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 	return os.Rename(tmp, path)

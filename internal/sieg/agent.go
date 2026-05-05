@@ -548,7 +548,10 @@ func encodeBatch(events []map[string]any) ([]byte, error) {
 		}
 	}
 	var gzipped bytes.Buffer
-	gz, _ := gzip.NewWriterLevel(&gzipped, gzip.BestSpeed)
+	gz, err := gzip.NewWriterLevel(&gzipped, gzip.BestSpeed)
+	if err != nil {
+		return nil, fmt.Errorf("gzip writer init: %w", err)
+	}
 	if _, err := gz.Write(raw.Bytes()); err != nil {
 		return nil, err
 	}

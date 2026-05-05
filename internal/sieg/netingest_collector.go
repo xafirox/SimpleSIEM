@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -113,10 +114,12 @@ func postCollectorGatewayReport(cfg Config, body any) error {
 			lastErr = err
 			continue
 		}
+		status := resp.StatusCode
 		_ = resp.Body.Close()
-		if httpStatusOK(resp.StatusCode) || resp.StatusCode == http.StatusNoContent {
+		if httpStatusOK(status) || status == http.StatusNoContent {
 			return nil
 		}
+		lastErr = fmt.Errorf("HTTP %d from %s", status, u)
 	}
 	return lastErr
 }

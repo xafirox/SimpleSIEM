@@ -235,18 +235,14 @@ func (st *networkIngestState) serveUDP(ctx context.Context) {
 			continue
 		}
 		// Note: oversize is no longer dropped at the boundary — we let
-		// handleFrame truncate + flag instead. But for UDP we still
-		// need to allocate enough buffer; if the datagram exceeded our
-		// read buffer, mark and pass.
+		// handleFrame truncate + flag instead. The buffer is sized
+		// maxFrameBytes+1 so we can distinguish "exactly the cap" from
+		// "exceeded the cap" — the +1th byte is read iff the datagram
+		// was larger than the cap.
 		raw := string(buf[:n])
-		truncatedAtRead := n >= st.maxFrameBytes
 		host, _ := splitHost(src.String())
-		if truncatedAtRead {
-			// Pass an oversized marker by appending — handleFrame
-			// detects via len(raw) > maxFrameBytes. A clean re-pad to
-			// maxFrameBytes+1 forces the truncation flag.
-			raw = raw + "\x00"
-		}
+		// handleFrame's own len(raw) > maxFrameBytes check sets the
+		// truncated flag and trims. No double-marking here.
 		st.handleFrame(raw, host, false, "syslog_udp")
 	}
 }
@@ -275,18 +271,24 @@ func (st *networkIngestState) handleTCPConn(ctx context.Context, conn net.Conn, 
 	host, _ := splitHost(conn.RemoteAddr().String())
 	r := bufio.NewReaderSize(conn, st.maxFrameBytes+1)
 	deadline := 60 * time.Second
+	transport := "syslog_tcp"
+	if useTLS {
+		transport = "syslog_tls"
+	}
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(deadline))
 		line, err := r.ReadString('\n')
+		// ReadString returns the data read so far even on error
+		// (ErrBufferFull, EOF). Process whatever was buffered before
+		// returning — otherwise a frame that fills the buffer without
+		// a trailing newline would be silently dropped instead of
+		// stored truncated.
+		if line != "" {
+			st.handleFrame(strings.TrimRight(line, "\r\n"), host, useTLS, transport)
+		}
 		if err != nil {
 			return
 		}
-		transport := "syslog_tcp"
-		if useTLS {
-			transport = "syslog_tls"
-		}
-		// Don't drop oversize — let handleFrame truncate + flag.
-		st.handleFrame(strings.TrimRight(line, "\r\n"), host, useTLS, transport)
 	}
 }
 
@@ -297,7 +299,30 @@ func (st *networkIngestState) handleTCPConn(ctx context.Context, conn net.Conn, 
 // `authenticated: false` flag, so investigators have full context.
 // Attack-pattern detection runs FIRST (before allowlist) so that
 // rogue-source attacks still alert.
+//
+// Wrapped in a recover so a panic on hostile input (e.g., a buggy
+// regex with catastrophic backtracking) doesn't bring down the
+// daemon — the frame is logged as a panic event and processing
+// continues for the next frame.
 func (st *networkIngestState) handleFrame(raw, sourceIP string, viaTLS bool, transport string) {
+	defer func() {
+		if r := recover(); r != nil {
+			if st.logger != nil {
+				st.logger.Write("errors", map[string]any{
+					"collector": "network_ingest",
+					"error":     fmt.Sprintf("frame validation panic: %v", r),
+					"source_ip": sourceIP,
+					"transport": transport,
+				})
+			}
+		}
+	}()
+	st.handleFrameInner(raw, sourceIP, viaTLS, transport)
+}
+
+// handleFrameInner is the actual frame validation body — extracted so
+// the public handleFrame can wrap it in a recover.
+func (st *networkIngestState) handleFrameInner(raw, sourceIP string, viaTLS bool, transport string) {
 	if raw == "" {
 		return
 	}
@@ -394,7 +419,7 @@ func (st *networkIngestState) handleFrame(raw, sourceIP string, viaTLS bool, tra
 			st.quarStore.Write("syslog", fields)
 		}
 	}
-	st.emitValidationStatus(unauthReason, sourceIP, mac, entry, hits, authenticated, viaTLS)
+	st.emitValidationStatus(unauthReason, sourceIP, mac, entry, hits, authenticated, viaTLS, raw)
 	if authenticated {
 		// Rules engine fires only on AUTHENTICATED frames so a rogue
 		// attacker can't fabricate fake alerts by spamming the listener
@@ -404,10 +429,12 @@ func (st *networkIngestState) handleFrame(raw, sourceIP string, viaTLS bool, tra
 }
 
 // emitValidationStatus surfaces the (un)authenticated decision + any
-// attack hits via meta events and the alert pipeline.
+// attack hits via meta events and the alert pipeline. The raw frame
+// is passed in so the indicator excerpt + the alert payload carry
+// enough context for forensic search.
 func (st *networkIngestState) emitValidationStatus(
 	unauthReason, ip, mac string, entry *networkSource,
-	hits []attackPattern, authenticated, viaTLS bool,
+	hits []attackPattern, authenticated, viaTLS bool, raw string,
 ) {
 	// Attack alert always fires at high severity.
 	if len(hits) > 0 {
@@ -423,7 +450,8 @@ func (st *networkIngestState) emitValidationStatus(
 			"source_mac":    mac,
 			"authenticated": authenticated,
 			"unauth_reason": unauthReason,
-			"indicator":     indicatorString(&first, ""),
+			"indicator":     indicatorString(&first, raw),
+			"frame_excerpt": frameExcerpt(raw),
 			"all_hits":      attackHitsCompact(hits),
 		}
 		if entry != nil {
@@ -434,17 +462,28 @@ func (st *networkIngestState) emitValidationStatus(
 		if st.logger != nil {
 			st.logger.Write("meta", payload)
 		}
+		alert := map[string]any{
+			"event":         "rule_match",
+			"rule":          "network_ingest_attack_detected",
+			"severity":      "high",
+			"host":          ip,
+			"matched_event": payload,
+			"original":      payload,
+			"tactic":        first.Tactic,
+			"technique":     first.Technique,
+		}
+		// Write the alert to the per-host alerts log so `simplesiem
+		// alerts` and other read-side tooling see it. Authenticated
+		// frames go under <entry.label>/alerts/; unauthenticated
+		// frames go under _unauthenticated/alerts/.
+		alertHost := "_unauthenticated"
+		if entry != nil && authenticated && entry.Label != "" {
+			alertHost = sanitiseHost(entry.Label)
+		}
+		if alertStorage, err := st.stamps(alertHost); err == nil && alertStorage != nil {
+			alertStorage.Write("alerts", alert)
+		}
 		if st.alertSink != nil {
-			alert := map[string]any{
-				"event":         "rule_match",
-				"rule":          "network_ingest_attack_detected",
-				"severity":      "high",
-				"host":          ip,
-				"matched_event": payload,
-				"original":      payload,
-				"tactic":        first.Tactic,
-				"technique":     first.Technique,
-			}
 			st.alertSink(alert)
 		}
 	}

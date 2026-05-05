@@ -104,7 +104,12 @@ func tryAgentReenroll(acfg AgentConfig, hostname string, log *Storage, tr *http.
 	const cooldown = 60 * time.Second
 	now := time.Now().UnixNano()
 	last := globalReenrollState.lastAttempt.Load()
-	if last != 0 && time.Duration(now-last) < cooldown {
+	// Compare via signed delta. A wall-clock backwards jump (NTP sync,
+	// VM resume) would make `now - last` negative; treat that as
+	// "cooldown expired" rather than overflowing into a huge positive
+	// duration that locks the agent out of re-enrollment forever.
+	delta := now - last
+	if last != 0 && delta >= 0 && time.Duration(delta) < cooldown {
 		return false, nil
 	}
 	psk, perr := readAgentEnrollPSK()

@@ -207,12 +207,22 @@ func validateNetworkAllowlist(entries []networkSource) error {
 
 // Save serialises the current in-memory state to disk via temp+rename.
 // Returns an error if write fails; in-memory state is unchanged.
+// Emits meta:network_allowlist_save_failed on failure so the operator
+// sees the disk-write error even when the caller swallows it.
 func (a *networkAllowlist) Save() error {
 	a.mu.RLock()
 	entries := a.snapshotLocked()
 	configVersion := a.configVersion
 	a.mu.RUnlock()
-	return saveNetworkAllowlistFile(a.path, configVersion, entries)
+	if err := saveNetworkAllowlistFile(a.path, configVersion, entries); err != nil {
+		a.emitMeta(map[string]any{
+			"event":  "network_allowlist_save_failed",
+			"detail": err.Error(),
+			"hint":   "in-memory state has the change; disk write failed (permissions / disk full?)",
+		})
+		return err
+	}
+	return nil
 }
 
 // snapshotLocked returns a sorted copy of the entries. Caller must
@@ -232,7 +242,8 @@ func (a *networkAllowlist) snapshotLocked() []networkSource {
 }
 
 func saveNetworkAllowlistFile(path string, configVersion int64, entries []networkSource) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 	file := networkAllowlistFile{
@@ -244,16 +255,38 @@ func saveNetworkAllowlistFile(path string, configVersion int64, entries []networ
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Use os.CreateTemp for a unique tmp path per call. Two concurrent
+	// Save() calls would otherwise share the same `<path>.tmp` and
+	// race on writes — the bytes interleave, both rename, and the
+	// surviving file is corrupted JSON. CreateTemp gives us a unique
+	// suffix; the rename remains atomic.
+	tmpFile, err := os.CreateTemp(dir, filepath.Base(path)+".tmp.")
+	if err != nil {
 		return err
 	}
-	if f, err := os.OpenFile(tmp, os.O_RDWR, 0o600); err == nil {
-		_ = f.Sync()
-		_ = f.Close()
+	tmp := tmpFile.Name()
+	defer func() {
+		// Best-effort cleanup if anything below this point fails.
+		if _, statErr := os.Stat(tmp); statErr == nil {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
 		return err
 	}
 	return nil
@@ -498,7 +531,16 @@ func (a *networkAllowlist) RemoveOwnerFromAll(peerID string) {
 	now := time.Now().UnixNano()
 	a.mu.Lock()
 	pruned := []string{}
-	for k, e := range a.byKey {
+	// Snapshot keys before mutating to keep iteration deterministic.
+	keys := make([]string, 0, len(a.byKey))
+	for k := range a.byKey {
+		keys = append(keys, k)
+	}
+	for _, k := range keys {
+		e, ok := a.byKey[k]
+		if !ok {
+			continue
+		}
 		if !containsString(e.Owners, peerID) {
 			continue
 		}
@@ -676,10 +718,21 @@ func (a *networkAllowlist) ApplySnapshot(snapshotConfigVersion int64, snapshotEn
 		incoming[allowlistKey(e.IP, e.MAC)] = e
 	}
 	added, removed, kept := 0, 0, 0
-	// Pass 1: remove or update entries we have.
-	for k, mine := range a.byKey {
-		theirs, ok := incoming[k]
+	// Pass 1: snapshot the keys we have BEFORE mutating, then decide
+	// per-key. Modifying byKey while ranging it is allowed by Go but
+	// the iteration order is undefined and entries may be skipped or
+	// re-visited; reconciliation must be deterministic.
+	currentKeys := make([]string, 0, len(a.byKey))
+	for k := range a.byKey {
+		currentKeys = append(currentKeys, k)
+	}
+	for _, k := range currentKeys {
+		mine, ok := a.byKey[k]
 		if !ok {
+			continue
+		}
+		theirs, has := incoming[k]
+		if !has {
 			if mine.Version < snapshotConfigVersion {
 				a.removeKeyLocked(k)
 				removed++
@@ -701,10 +754,18 @@ func (a *networkAllowlist) ApplySnapshot(snapshotConfigVersion int64, snapshotEn
 		}
 		clone := *theirs
 		a.byKey[k] = &clone
-		ipKey := strings.ToLower(strings.TrimSpace(theirs.IP))
-		a.byIP[ipKey] = append(a.byIP[ipKey], a.byKey[k])
 		added++
 	}
+	// Rebuild byIP from the final byKey state. Pass 1's same-key
+	// version-bumps replaced byKey pointers but left byIP holding the
+	// OLD pointers — Lookup() would then return stale entry data.
+	// Snapshot the entries into a stable backing slice so byIP/byKey
+	// pointers stay valid.
+	finalEntries := make([]networkSource, 0, len(a.byKey))
+	for _, e := range a.byKey {
+		finalEntries = append(finalEntries, *e)
+	}
+	a.rebuildIndex(finalEntries)
 	a.configVersion = snapshotConfigVersion
 	a.mu.Unlock()
 	if err := a.Save(); err != nil {

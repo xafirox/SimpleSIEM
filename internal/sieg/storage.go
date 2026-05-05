@@ -389,7 +389,6 @@ func (s *Storage) writeNow(logType string, event map[string]any) {
 	sum := sha512.Sum384(pre)
 	hashHex := hex.EncodeToString(sum[:])
 	event["_hash"] = hashHex
-	s.prevHash[logType] = hashHex
 
 	data, err := json.Marshal(event)
 	if err != nil {
@@ -402,8 +401,17 @@ func (s *Storage) writeNow(logType string, event map[string]any) {
 		return
 	}
 	if _, err := h.Write(data); err != nil {
+		// Disk write failed. Don't advance the in-memory prevHash —
+		// otherwise the NEXT event's `_prev` references a hash that
+		// never made it to disk, breaking chain validation. Also roll
+		// back the seq counter so the next write retries the same
+		// position cleanly.
+		s.seq[logType]--
 		return
 	}
+	// Only advance the chain head AFTER the line successfully landed
+	// on disk.
+	s.prevHash[logType] = hashHex
 
 	// Per-file size cap: once exceeded, close + rotate to .jsonl.N and
 	// open a fresh file. The chain resets at this boundary; verifier sees
@@ -802,7 +810,12 @@ func compressFile(path string) error {
 	if err != nil {
 		return err
 	}
-	gz, _ := gzip.NewWriterLevel(out, gzip.BestCompression)
+	gz, err := gzip.NewWriterLevel(out, gzip.BestCompression)
+	if err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
 	if _, err := io.Copy(gz, in); err != nil {
 		gz.Close()
 		out.Close()

@@ -485,7 +485,12 @@ func (tx *restoreTx) ensureParent(p string) error {
 // backup can't write outside the staging dirs.
 func (tx *restoreTx) stagingPathFor(archiveName string) (string, error) {
 	clean := filepath.ToSlash(filepath.Clean(archiveName))
-	if strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") || strings.HasPrefix(clean, "/") {
+	// Reject path-traversal AND absolute paths on every platform.
+	// On Windows, filepath.Clean("C:\\etc\\passwd") yields "C:\etc\passwd";
+	// after ToSlash, "C:/etc/passwd" — doesn't start with "/" but
+	// IS absolute. filepath.IsAbs catches both Unix and Windows.
+	if strings.HasPrefix(clean, "../") || strings.Contains(clean, "/../") ||
+		strings.HasPrefix(clean, "/") || filepath.IsAbs(archiveName) || filepath.IsAbs(clean) {
 		return "", fmt.Errorf("rejecting suspicious tar entry %q", archiveName)
 	}
 	if clean == "manifest.json" {
@@ -583,11 +588,46 @@ func (tx *restoreTx) rollback() {
 	}
 }
 
+// symlinkTargetSafe checks that creating `linkAt -> linkTo` keeps the
+// resolved target within the staging tree (one directory level up
+// from linkAt). Refuses absolute targets and `..` paths that escape.
+func symlinkTargetSafe(linkAt, linkTo string) bool {
+	if linkTo == "" {
+		return false
+	}
+	if filepath.IsAbs(linkTo) {
+		return false
+	}
+	// Resolve linkTo relative to linkAt's directory.
+	stagingRoot := filepath.Dir(linkAt)
+	resolved := filepath.Clean(filepath.Join(stagingRoot, linkTo))
+	// resolved must stay under stagingRoot (or one of its ancestors
+	// up to a reasonable depth — tar archives sometimes have ../ for
+	// sibling-dir relative links). We refuse anything that escapes
+	// the parent of stagingRoot.
+	stagingParent := filepath.Dir(stagingRoot)
+	rel, err := filepath.Rel(stagingParent, resolved)
+	if err != nil {
+		return false
+	}
+	if strings.HasPrefix(rel, "..") {
+		return false
+	}
+	return true
+}
+
 func writeStagedEntry(target string, h *tar.Header, body io.Reader) error {
 	switch h.Typeflag {
 	case tar.TypeDir:
 		return os.MkdirAll(target, os.FileMode(h.Mode)|0o700)
 	case tar.TypeSymlink:
+		// Validate the link target stays within the staging dir. A
+		// malicious .siembak with `Linkname=/etc/passwd` would
+		// otherwise plant a symlink that redirects post-restore reads
+		// to attacker-chosen paths (zip-slip / symlink-slip class).
+		if !symlinkTargetSafe(target, h.Linkname) {
+			return fmt.Errorf("refusing symlink that escapes staging dir: %s -> %s", h.Name, h.Linkname)
+		}
 		_ = os.MkdirAll(filepath.Dir(target), 0o700)
 		_ = os.Remove(target)
 		return os.Symlink(h.Linkname, target)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -112,17 +113,17 @@ func postAgentGatewayReport(cfg AgentConfig, body any) error {
 			lastErr = err
 			continue
 		}
+		status := resp.StatusCode
 		_ = resp.Body.Close()
-		if httpStatusOK(resp.StatusCode) || resp.StatusCode == http.StatusNoContent {
+		if httpStatusOK(status) || status == http.StatusNoContent {
 			return nil
 		}
-		lastErr = err
+		// Non-2xx: capture as a real error so the caller knows we
+		// tried all URLs and none accepted. Without this lastErr
+		// stays nil and the function falsely reports success.
+		lastErr = fmt.Errorf("HTTP %d from %s", status, u)
 	}
-	if lastErr != nil {
-		return lastErr
-	}
-	// silently treat 4xx as transient
-	return nil
+	return lastErr
 }
 
 // agentTLSConfig is implemented in agent.go; we add a wrapper here to

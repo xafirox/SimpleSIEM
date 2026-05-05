@@ -402,12 +402,29 @@ func (c *FileCollector) loop(ctx context.Context) {
 					return nil
 				}
 				if d.IsDir() {
-					_ = w.Add(p)
+					if werr := w.Add(p); werr != nil {
+						// inotify limit (ENOSPC), permission denied,
+						// stale path. Surface to errors so operators
+						// know events for this subtree aren't being
+						// captured rather than silently swallowing it.
+						c.storage.Write("errors", map[string]any{
+							"collector": "files",
+							"error":     "inotify watch failed: " + werr.Error(),
+							"path":      p,
+							"hint":      "raise /proc/sys/fs/inotify/max_user_watches or narrow file_watch_paths",
+						})
+					}
 				}
 				return nil
 			})
 		} else {
-			_ = w.Add(path)
+			if werr := w.Add(path); werr != nil {
+				c.storage.Write("errors", map[string]any{
+					"collector": "files",
+					"error":     "inotify watch failed: " + werr.Error(),
+					"path":      path,
+				})
+			}
 		}
 	}
 
