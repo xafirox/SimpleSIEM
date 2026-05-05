@@ -179,6 +179,19 @@ func (t *tailReader) printPretty(line []byte) {
 		hostCol = fmt.Sprintf("%-12s ", t.host)
 	}
 	prefix := fmt.Sprintf("%s  %s%-9s  ", tsCol, hostCol, t.logType)
+	// Visual indicators for syslog frames: [UNAUTH] for unauthenticated
+	// frames stored in the quarantine bucket; [ATTACK] when the
+	// attack-pattern detector flagged the frame. Indicators are
+	// independent — a frame can have both.
+	if t.logType == "syslog" {
+		auth, ok := data["authenticated"].(bool)
+		if ok && !auth {
+			summary = colorize("[UNAUTH] ", colYellow) + summary
+		}
+		if _, has := data["attack_indicators"]; has {
+			summary = colorize("[ATTACK] ", colRed) + summary
+		}
+	}
 	if t.logType == "alerts" {
 		sev, _ := data["severity"].(string)
 		if code := severityColor(sev); code != "" {

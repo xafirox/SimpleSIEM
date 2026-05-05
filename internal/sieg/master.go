@@ -148,6 +148,46 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 	// only one collector may ever associate with this master.
 	startMasterCollectorListener(ctx, wg, cfg, defaultConfigPath(), masterStore)
 
+	// Network-device sticky-IP allowlist (master-tier). Owns the
+	// canonical copy in master-managed realms; pushes to every
+	// consenting server.
+	initNetworkSyncImpls()
+	masterNetStore := newNetworkAllowlist(networkAllowlistPath(), masterStore)
+	if err := masterNetStore.Load(); err != nil {
+		masterNetStore.EmitReloadRejected("startup", err.Error())
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		newNetworkAllowlistWatcher(masterNetStore).run(ctx)
+	}()
+	startMasterNetworkIngestListener(ctx, wg, cfg, masterStore, masterNetStore)
+	if niSt, err := startNetworkIngest(ctx, wg, cfg, "master", masterNetStore, masterStore,
+		func(host string) (*Storage, error) {
+			return openHostStorage(cfg.LogDir, host, cfg.LogOwnerGroup)
+		},
+		func() []*alertRule { return loadMasterRules(cfg) },
+		func(alert map[string]any) {
+			for _, h := range masterStore.alertHooks {
+				h(alert)
+			}
+		}); err != nil {
+		masterStore.Write("errors", map[string]any{
+			"collector": "network_ingest",
+			"error":     err.Error(),
+		})
+	} else {
+		_ = niSt
+	}
+	go func() {
+		time.Sleep(1 * time.Second)
+		autoDiscoverOwnGateways(masterNetStore, "master-self", masterStore)
+	}()
+	go func() {
+		time.Sleep(2 * time.Second)
+		_ = pullAllowlistFromServers(cfg, masterNetStore)
+	}()
+
 	// Cert expiry monitor — every per-server cert + CA the master holds.
 	startCertExpiryMonitor(ctx, wg, masterStore, "master", collectMasterCertPaths(cfg))
 	// Hourly signing of chain heads — same purpose as on standalone

@@ -433,6 +433,13 @@ type ServerConfig struct {
 	RatePerSecond        int `json:"rate_per_second"`         // per-IP token-bucket fill rate
 	RateBurst            int `json:"rate_burst"`              // per-IP token-bucket capacity
 	MaxClockSkew         int `json:"max_clock_skew_seconds"`  // accept ts within ±this many seconds of received_at
+	// NetworkIngest configures the sticky-IP-allowlisted syslog
+	// listener for ingesting events from non-SimpleSIEM devices
+	// (firewalls, switches, IoT). Default disabled; must be opted
+	// into. Servers and masters are the only modes that may
+	// enable it. See docs/network-ingest.md.
+	NetworkIngest NetworkIngestConfig `json:"network_ingest"`
+
 	// AgentReauthSeconds is how often each agent must hit /v1/heartbeat
 	// to renew its session. Inside the window, /v1/events skips the
 	// allowlist re-check; outside it, the agent is treated as expired
@@ -550,6 +557,12 @@ type MasterConfig struct {
 	// dial; the per-collector client cert lives under
 	// <config>/master/query-collector/<peer-id>/.
 	QueryCollectorURL string `json:"query_collector_url"`
+
+	// NetworkIngest configures the network-device syslog listener
+	// at master tier. Same shape as cfg.Server.NetworkIngest. Used
+	// when operators want a master-tier listener (typically because
+	// the master itself is on the management VLAN).
+	NetworkIngest NetworkIngestConfig `json:"network_ingest"`
 
 	// RulesPath is the master-side detection rules file. When set,
 	// every event the master pulls from a registered server is
@@ -705,6 +718,34 @@ func defaultConfig() Config {
 				// server in the realm (and syncs to peers in Phase B).
 				Name:                "default",
 				SyncIntervalSeconds: 60,
+			},
+			// Network-device ingest is ON by default. The allowlist
+			// starts empty (only the host's own gateway is auto-added
+			// on install/convert), so NO non-SimpleSIEM frames can post
+			// until the operator runs `simplesiem network-source add`.
+			// Default cert posture: auto-generated self-signed; the
+			// SHA-256 fingerprint is emitted via meta:network_ingest_tls_cert
+			// for vendor pinning. UDP / cleartext-TCP listeners are
+			// disabled by default — operators opt into those explicitly.
+			NetworkIngest: NetworkIngestConfig{
+				Enabled:                     true,
+				SyslogTLSListen:             ":6514",
+				TLSCertMode:                 "selfsigned",
+				MaxFrameBytes:               65536,
+				MaxFramesPerSourcePerSecond: 1000,
+				BindExplicit:                true,
+				RDNSCacheTTLSeconds:         300,
+			},
+		},
+		Master: MasterConfig{
+			NetworkIngest: NetworkIngestConfig{
+				Enabled:                     true,
+				SyslogTLSListen:             ":6515",
+				TLSCertMode:                 "selfsigned",
+				MaxFrameBytes:               65536,
+				MaxFramesPerSourcePerSecond: 1000,
+				BindExplicit:                true,
+				RDNSCacheTTLSeconds:         300,
 			},
 		},
 	}
@@ -999,6 +1040,10 @@ func Run() {
 		}
 	case "honey":
 		runHoneyCmd(subArgs)
+	case "network-source":
+		runNetworkSourceCmd(subArgs)
+	case "net-send":
+		runNetSendCmd(subArgs)
 	case "probe":
 		runProbeCmd(subArgs)
 	case "version", "-v", "--version":

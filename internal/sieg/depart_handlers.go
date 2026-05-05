@@ -54,6 +54,13 @@ func (s *serverState) handleAgentDepart(w http.ResponseWriter, r *http.Request) 
 	s.allowlistMu.Unlock()
 	_ = removeFromConfigAllowlist(s.configPath, cn)
 
+	// Strip the departing agent from every network-allowlist entry's
+	// owners list. Orphaned gateway entries are pruned (they were only
+	// in the allowlist because this agent vouched for them).
+	if s.networkAllowlist != nil {
+		s.networkAllowlist.RemoveOwnerFromAll(cn)
+	}
+
 	if st, err := s.storageFor(cn); err == nil && st != nil {
 		st.Write("meta", map[string]any{
 			"event":  "agent_departed",

@@ -74,6 +74,20 @@ func startCollectorDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (
 		localStore.SetRules(rules)
 	}
 
+	// Collectors never bind the network-ingest listener — but they DO
+	// report their own gateway up to their source (master or server)
+	// so the realm allowlist stays in sync with this host's L2 view.
+	startCollectorGatewayReporter(ctx, wg, cfg, collectorStore)
+	// Surface a misconfig if the operator left network_ingest.enabled
+	// on a collector — the listener is silently disabled either way,
+	// but the meta event makes the misconfig visible.
+	if cfg.Server.NetworkIngest.Enabled || cfg.Master.NetworkIngest.Enabled {
+		collectorStore.Write("meta", map[string]any{
+			"event": "network_ingest_refused",
+			"mode":  "collector",
+			"hint":  "network ingest is server/master-only; remove .network_ingest.enabled",
+		})
+	}
 	collectorStore.Write("meta", map[string]any{
 		"event":     "start",
 		"mode":      "collector",

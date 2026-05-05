@@ -203,6 +203,33 @@ simplesiem <command> [flags]
   honey list                  Show registered tokens with last-touched timestamp.
   honey remove <path>         Stop monitoring this token.
 
+  network-source add --ip <ip> --vendor <id> [--mac <mac>]
+       [--label "..."] [--no-tls]
+                              (ni) Add a non-SimpleSIEM device (firewall, switch, IoT)
+                              to the sticky-IP allowlist. --vendor is REQUIRED; use
+                              `other` for unsupported vendors (no auto TLS posture).
+                              ARP-resolves the MAC if --mac is omitted. Vendor with
+                              required-TLS auto-sets tls_required=true (and refuses
+                              --no-tls). Server/master mode only — refused on
+                              agent / standalone / collector.
+  network-source list [--stale-only]
+                              Show the allowlist; --stale-only filters to rows whose
+                              ARP-resolved MAC no longer matches.
+  network-source remove --ip <ip> [--mac <mac>] [--force]
+                              Delete an entry. --force needed for kind=gateway entries.
+  network-source rename --ip <ip> [--mac <mac>] --label "<label>"
+                              Update label only. rDNS-at-add-time is locked in;
+                              rename is the only path to change a label.
+  network-source revalidate   Re-ARP every entry; flag missing/changed MACs as stale.
+  network-source resync       Pull the canonical allowlist from the authority
+                              (master, or peer set if no master) and reconcile.
+  network-source vendors      Print the bundled vendor catalog (TLS posture per vendor).
+
+  net-send --host <h> --port <p> --transport udp|tcp|tls --message <frame>
+       [--insecure] [--count N] [--interval-ms N]
+                              Diagnostic helper: send a syslog frame to the listener.
+                              Used by tests/uat to simulate firewalls + rogue devices.
+
   master query-collector enroll <url> --key <PSK>
                               Pair this master with a paired collector for archive
                               queries. Writes cert under <config>/master/query-collector/<host>/.
@@ -537,6 +564,17 @@ The storage controller probes the active volume every 30 s with a 5 s shared cac
 | `server.master_revoked` | master-CN counterpart of `agent_revoked`. Same propagation. |
 | `server.master_can_rotate_ca` | opt-in (default `false`). When `true`, masters in `master_cns` can trigger this server's `init-rotate` / `finalize-rotate` via `/v1/master/*` endpoints. Required for `master rotate-ca-all` to work against this server. |
 | `server.master_can_uninstall` | opt-in (default `false`). When `true`, masters in `master_cns` can trigger this server's full local uninstall via `/v1/master/uninstall-self` (the `master uninstall-all` cascade). Same rationale as `master_can_rotate_ca`: a destructive cluster-wide operation must require an explicit per-node opt-in so a compromised master can't wipe the fleet by surprise. |
+| `server.network_ingest.enabled` | enable the syslog listener for non-SimpleSIEM devices. **Default `true`.** Listener binds the configured ports; allowlist starts empty so no rogue frames can post until the operator adds devices. Refused on agent / standalone / collector modes (a `meta:network_ingest_refused` event is emitted instead). See [network-ingest.md](network-ingest.md). |
+| `server.network_ingest.syslog_udp_listen` / `syslog_tcp_listen` / `syslog_tls_listen` | bind addresses for the three transports. Default: only TLS (`:6514` server / `:6515` master) is bound; UDP and cleartext-TCP are off. Empty disables a given transport. RFC 5425 TLS is the recommended posture for vendors that support it. |
+| `server.network_ingest.tls_cert_mode` | `"server"` (reuse SimpleSIEM server cert; vendors must trust the SimpleSIEM CA), `"operator"` (operator-supplied `tls_cert` + `tls_key`), or `"selfsigned"` (auto-generated EC P-384 cert at `<state>/network_ingest/{cert,key}.pem`; SHA-256 fingerprint emitted via `meta:network_ingest_tls_cert` for vendor pinning). Default `"selfsigned"`. |
+| Frame storage | Frames are persisted in two distinct paths based on validation outcome. **Authenticated** frames (passed sticky-IP + MAC + TLS-posture checks) → `<log_dir>/<entry.label>/syslog/<date>.jsonl` with `authenticated: true`. **Unauthenticated** frames (failed any check) → `<log_dir>/_unauthenticated/syslog/<date>.jsonl` with `authenticated: false` and `unauth_reason` ∈ {`unknown_source_ip`, `mac_mismatch`, `cleartext_refused`, `entry_stale`}. The rule engine fires only on authenticated frames. The only path that drops without storing is the per-source rate-limit overflow. |
+| Attack-pattern detector | Built-in pattern set runs on every frame **before** allowlist validation. Hits emit `meta:network_ingest_attack_detected{reason, tactic, technique, severity:"high", indicator}` and fan an alert through the alert pipeline. Patterns are mapped to MITRE ATT&CK tactic + technique IDs so `simplesiem alerts --technique <ID>` and `simplesiem rules coverage` work without setup. Operator-extensible via `<config>/attack-patterns.json` (hot-reloaded; malformed JSON rejected with `meta:attack_patterns_reload_rejected`). Frame excerpts in alerts are sanitised — control characters become `?` so an attacker can't smuggle ANSI escapes into operator terminals viewing the alert. |
+| `server.network_ingest.tls_cert` / `tls_key` | operator-supplied PEM paths; only consulted when `tls_cert_mode = "operator"`. |
+| `server.network_ingest.bind_explicit` | required for any non-loopback bind. Default `true` (because network ingest is on by default; the operator opts in by leaving the default config). Set to `false` to refuse any non-loopback bind — useful as a guardrail in environments where the operator wants to disable accidental WAN exposure even on the default port. |
+| `server.network_ingest.max_frame_bytes` | hard cap per frame (default 64 KiB). Oversize frames dropped at the boundary; `meta:network_ingest_oversize` emitted. |
+| `server.network_ingest.max_frames_per_source_per_second` | per-source-IP rate limit (default 1000). Overflow emits `meta:network_ingest_rate_limited` (rate-limited so the meta log doesn't drown). |
+| `server.network_ingest.master_can_push_allowlist` | per-server consent flag for `/v1/master/network-allowlist` push. Default `false`. Same posture as `master_can_uninstall` / `master_can_rotate_ca`. |
+| `server.network_ingest.rdns_cache_ttl_seconds` | rDNS lookup cache TTL for unlabelled devices (default 300). The label-at-add-time stays locked in regardless. |
 | `server.collect_locally` | when true (default), the server also runs collectors against its own host and stores the events under `<log_dir>/<local_id>/`. Disable for a pure receiver. |
 | `server.local_id` | identifier for the server's own host events; defaults to `os.Hostname()`. Falls back to `_localhost` if the hostname isn't a valid agent ID. |
 | `server.max_batch_bytes` | hard cap on POST body (compressed) |

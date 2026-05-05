@@ -139,6 +139,12 @@ func startMasterCollectorListener(ctx context.Context, wg *sync.WaitGroup, cfg C
 	// from its uninstall path so the master frees the single
 	// collector slot without waiting for a heartbeat to lapse.
 	mux.HandleFunc("/v1/collector/depart", st.handleCollectorDepartOnMaster)
+	// Collectors paired with a master report their own default
+	// gateway up so the realm allowlist stays in sync. Same body
+	// shape as the server-side /v1/collector/gateway handler.
+	mux.HandleFunc("/v1/collector/gateway", func(w http.ResponseWriter, r *http.Request) {
+		st.handleCollectorGatewayReportMaster(w, r)
+	})
 
 	srv := &http.Server{
 		Addr:              addr,

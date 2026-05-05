@@ -411,6 +411,45 @@ sudo simplesiem mitre generate-rules --include T1059.001   # un-reject
 
 ---
 
+## Network device ingest (firewalls / switches / IoT)
+
+ON BY DEFAULT on server / master modes — RFC 5425 TLS listener bound on `:6514` (server) / `:6515` (master) with an auto-generated self-signed cert. Frames that fail allowlist validation are STORED in `<log_dir>/_unauthenticated/syslog/` (not dropped) with `authenticated: false` so investigators see attack attempts. Built-in attack-pattern detector (SQL injection, command injection, Log4Shell, path traversal, XSS, XXE, LDAP, format-string, buffer flood, HTTP-in-syslog, etc.) runs on every frame and tags hits with MITRE ATT&CK technique IDs at `severity: high`. Operator-extensible via `<config>/attack-patterns.json` (hot-reloaded). Every named vendor requires TLS; use `--vendor other` for cleartext-only legacy gear. Full doc: [network-ingest.md](network-ingest.md).
+
+```bash
+# Print the TLS fingerprint to pin on each device.
+sudo simplesiem query --type meta --grep network_ingest_tls_cert | jq -r .detail
+
+# Add a device. --vendor is REQUIRED. Use 'other' for unsupported vendors.
+sudo simplesiem network-source add --ip <device-ip> --vendor pfsense --label main-fw
+sudo simplesiem network-source add --ip <device-ip> --vendor other --label generic-iot --no-tls
+sudo simplesiem network-source list                      # show full allowlist
+sudo simplesiem network-source list --stale-only         # ARP-disagrees rows
+sudo simplesiem network-source revalidate                # re-ARP every entry
+sudo simplesiem network-source rename --ip <ip> --label "boundary-fw"
+sudo simplesiem network-source remove --ip <ip> [--mac <mac>] [--force]
+sudo simplesiem network-source resync                    # pull canonical from authority
+sudo simplesiem network-source vendors                   # supported vendor catalog (pfsense, fortigate, cisco_ios, cisco_meraki, sonicwall, ubiquiti, hpe_aruba, other)
+
+# Operator-supplied TLS cert (Let's Encrypt / internal PKI).
+sudo jq '.server.network_ingest.tls_cert_mode = "operator" |
+         .server.network_ingest.tls_cert = "/etc/letsencrypt/live/siem.example.com/fullchain.pem" |
+         .server.network_ingest.tls_key  = "/etc/letsencrypt/live/siem.example.com/privkey.pem"' \
+  /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
+sudo simplesiem restart
+
+# Add UDP and/or cleartext TCP listeners alongside the default TLS.
+sudo jq '.server.network_ingest.syslog_udp_listen = ":514" |
+         .server.network_ingest.syslog_tcp_listen = ":1514"' \
+  /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
+sudo simplesiem restart
+
+# Disable network ingest entirely.
+sudo jq '.server.network_ingest.enabled = false' /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
+sudo simplesiem restart
+```
+
+---
+
 ## Troubleshooting cheats
 
 ```bash

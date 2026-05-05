@@ -175,6 +175,8 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 	// re-enrollment goes through the standard PSK handshake instead
 	// of inheriting the prior identity.
 	mux.HandleFunc("/v1/agent/depart", st.handleAgentDepart)
+	mux.HandleFunc("/v1/agent/gateway", st.handleAgentGatewayReport)
+	mux.HandleFunc("/v1/collector/gateway", st.handleCollectorGatewayReport)
 	mux.HandleFunc("/v1/master/depart", st.handleMasterDepart)
 	mux.HandleFunc("/v1/collector/depart", st.handleCollectorDepart)
 	// Master cascade uninstall — gated by server.master_can_uninstall.
@@ -292,6 +294,52 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 		// pruner, MITRE auto-fetch, threat-intel) start alongside.
 		st.alertPipeline = newAlertPipeline(cfg, cfg.LogDir, loggerStore)
 		st.tupleMgr = startSiemEnhancements(ctx, wg, cfg, loggerStore, st.alertPipeline)
+
+		// Network-device sticky-IP allowlist + syslog ingest listener.
+		// Server is one of the two modes that may bind a listener
+		// (master is the other). The allowlist sidecar lives next to
+		// config.json; mutations are atomic and hot-reloadable.
+		initNetworkSyncImpls()
+		netStore := newNetworkAllowlist(networkAllowlistPath(), loggerStore)
+		if err := netStore.Load(); err != nil {
+			netStore.EmitReloadRejected("startup", err.Error())
+		}
+		st.networkAllowlist = netStore
+		installNetworkIngestServerEndpoints(mux, st, netStore)
+		// Hot-reload watcher for the allowlist sidecar.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			newNetworkAllowlistWatcher(netStore).run(ctx)
+		}()
+		// The syslog listener (if enabled).
+		if niSt, err := startNetworkIngest(ctx, wg, cfg, "server", netStore, loggerStore,
+			st.storageFor, func() []*alertRule { return st.rules },
+			func(alert map[string]any) {
+				for _, h := range loggerStore.alertHooks {
+					h(alert)
+				}
+			}); err != nil {
+			loggerStore.Write("errors", map[string]any{
+				"collector": "network_ingest",
+				"error":     err.Error(),
+			})
+		} else if niSt != nil {
+			st.networkIngest = niSt
+		}
+		// Pending-push dispatcher (server → master). No-op on a
+		// realm without a master.
+		newPendingPushDispatcher(cfg, netStore).start(ctx, wg)
+		// One-shot resync at startup.
+		go func() {
+			time.Sleep(2 * time.Second)
+			_ = pullAllowlistFromMaster(cfg, netStore)
+		}()
+		// Auto-discover own gateway and add it to the allowlist.
+		go func() {
+			time.Sleep(1 * time.Second)
+			autoDiscoverOwnGateways(netStore, "server-self", loggerStore)
+		}()
 	}
 
 	// Pending-join watcher: completes a master-driven realm migration
@@ -495,6 +543,12 @@ type serverState struct {
 	// rationale as masterCanRotate: the operator must explicitly
 	// trust the master with destructive cluster-wide operations.
 	masterCanUninstall bool
+
+	// Network-device ingest state. Owned by serverState so the
+	// hot-reload watcher and the master-push endpoints can both
+	// reach the same store.
+	networkAllowlist *networkAllowlist
+	networkIngest    *networkIngestState
 
 	// identityGuard state (see identity_guard.go). Tracks per-CN
 	// last-seen (ip, ts) so a second daemon presenting the same

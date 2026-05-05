@@ -121,6 +121,13 @@ func startDaemon(cfgPath string) (*daemonState, error) {
 	}
 	startSiemEnhancements(ctx, &wg, cfg, storage, pipeline)
 
+	if cfg.Server.NetworkIngest.Enabled || cfg.Master.NetworkIngest.Enabled {
+		storage.Write("meta", map[string]any{
+			"event": "network_ingest_refused",
+			"mode":  "standalone",
+			"hint":  "network ingest is server/master-only; remove .network_ingest.enabled",
+		})
+	}
 	storage.Write("meta", map[string]any{
 		"event":            "start",
 		"mode":             mode,
@@ -371,9 +378,20 @@ func startAgentDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*dae
 		local.Write("errors", map[string]any{"collector": "agent", "error": err.Error()})
 		return nil, err
 	}
+	// Surface a meta event if the operator has misconfigured an agent
+	// with cfg.server.network_ingest.enabled=true — agents NEVER bind
+	// the syslog listener; only servers and masters do.
+	if cfg.Server.NetworkIngest.Enabled || cfg.Master.NetworkIngest.Enabled {
+		local.Write("meta", map[string]any{
+			"event": "network_ingest_refused",
+			"mode":  "agent",
+			"hint":  "network ingest is server/master-only; remove .network_ingest.enabled",
+		})
+	}
 	go agentTLSPing(cfg.Agent, local)
 	wg.Add(1)
 	go agentHeartbeatLoop(ctx, wg, cfg.Agent, local)
+	startAgentGatewayReporter(ctx, wg, cfg.Agent, local)
 	startCertExpiryMonitor(ctx, wg, local, "agent", collectAgentCertPaths(cfg))
 
 	// Build a dedicated Storage that forwards to the shipper. The
