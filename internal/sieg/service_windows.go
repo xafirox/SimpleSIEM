@@ -99,7 +99,11 @@ func installService(args []string) {
 		}
 	}
 	if _, err := os.Stat(cfgFile); os.IsNotExist(err) {
-		if err := os.WriteFile(cfgFile, []byte(configJSONForMode(chosenMode)), 0o644); err != nil {
+		// Mode bits map loosely to NTFS ACLs on Windows but the
+		// atomicWriteFile + tighter mode still surface intent in the
+		// audit and avoid leaving a partially-written config behind on
+		// installer crashes.
+		if err := atomicWriteFile(cfgFile, []byte(configJSONForMode(chosenMode)), 0o600); err != nil {
 			fatalf("write config: %v", err)
 		}
 		fmt.Println("wrote default config:", cfgFile, "(mode:", chosenMode+")")

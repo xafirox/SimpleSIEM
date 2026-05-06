@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -107,9 +108,9 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 		trust:             bundle,
 		agentRevoked:      copyStringMap(cfg.Server.AgentRevoked),
 		masterRevoked:     copyStringMap(cfg.Server.MasterRevoked),
-		masterCanRotate:   cfg.Server.MasterCanRotateCA,
-		masterCanUninstall: cfg.Server.MasterCanUninstall,
 	}
+	st.masterCanRotate.Store(cfg.Server.MasterCanRotateCA)
+	st.masterCanUninstall.Store(cfg.Server.MasterCanUninstall)
 	if rules, err := loadRules(cfg.RulesPath); err == nil {
 		st.rules = rules
 	}
@@ -264,7 +265,7 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 		// after configurable window. Dispatch routes through the
 		// same fanout as regular alerts.
 		if esc := newAlertEscalator(cfg.Server, cfg.LogDir, cfg.Mode, loggerStore, func(alert map[string]any) {
-			for _, h := range loggerStore.alertHooks {
+			for _, h := range loggerStore.SnapshotAlertHooks() {
 				h(alert)
 			}
 		}); esc != nil {
@@ -314,9 +315,9 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 		}()
 		// The syslog listener (if enabled).
 		if niSt, err := startNetworkIngest(ctx, wg, cfg, "server", netStore, loggerStore,
-			st.storageFor, func() []*alertRule { return st.rules },
+			st.storageFor, st.snapshotRules,
 			func(alert map[string]any) {
-				for _, h := range loggerStore.alertHooks {
+				for _, h := range loggerStore.SnapshotAlertHooks() {
 					h(alert)
 				}
 			}); err != nil {
@@ -460,8 +461,14 @@ type serverState struct {
 	queueSize       int
 	tokens          []string
 	allowBearerOnly bool
-	rules           []*alertRule
-	maxClockSkew    time.Duration
+	// rules is the active rule set used by the rule engine across the
+	// HTTP receiver, network-ingest listener, and per-host storages.
+	// rulesMu guards it because handleMasterPushRules can replace the
+	// slice at runtime while readers (storageFor, the netingest closure,
+	// rule evaluators) iterate it concurrently.
+	rulesMu      sync.RWMutex
+	rules        []*alertRule
+	maxClockSkew time.Duration
 	limiter         *rateLimiter
 	semaphore       chan struct{}
 
@@ -535,14 +542,17 @@ type serverState struct {
 	// /v1/master/rotate-ca and /v1/master/finalize-rotate. Default
 	// false so a compromised master can't destroy CA keys without
 	// explicit operator opt-in.
-	masterCanRotate bool
+	//
+	// atomic.Bool because configWatcher hot-flips this concurrently
+	// with HTTP handlers reading the gate.
+	masterCanRotate atomic.Bool
 
 	// masterCanUninstall mirrors cfg.Server.MasterCanUninstall —
 	// gates /v1/master/uninstall-self. Default false. Required for
 	// a `master uninstall-all` cascade to reach this server. Same
 	// rationale as masterCanRotate: the operator must explicitly
 	// trust the master with destructive cluster-wide operations.
-	masterCanUninstall bool
+	masterCanUninstall atomic.Bool
 
 	// Network-device ingest state. Owned by serverState so the
 	// hot-reload watcher and the master-push endpoints can both
@@ -682,6 +692,24 @@ func validAgentID(id string) bool {
 	return true
 }
 
+// snapshotRules returns the current rules slice under the rules mutex
+// so callers iterate a stable view even if handleMasterPushRules swaps
+// the slice mid-iteration.
+func (s *serverState) snapshotRules() []*alertRule {
+	s.rulesMu.RLock()
+	defer s.rulesMu.RUnlock()
+	return s.rules
+}
+
+// setRules replaces the active rule set under the rules mutex. Used by
+// the master push handler so the swap and the per-storage propagation
+// happen atomically with respect to readers.
+func (s *serverState) setRules(rules []*alertRule) {
+	s.rulesMu.Lock()
+	s.rules = rules
+	s.rulesMu.Unlock()
+}
+
 func (s *serverState) storageFor(host string) (*Storage, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -692,8 +720,8 @@ func (s *serverState) storageFor(host string) (*Storage, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(s.rules) > 0 {
-		st.SetRules(s.rules)
+	if rules := s.snapshotRules(); len(rules) > 0 {
+		st.SetRules(rules)
 	}
 	if s.alertWebhooks != nil {
 		// Wire the alert dispatcher into this fresh Storage so
@@ -798,12 +826,21 @@ func (s *serverState) requestAuthenticated(r *http.Request) bool {
 		return false
 	}
 	tok := strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if tok == "" {
+		return false
+	}
+	tokBytes := []byte(tok)
+	// Walk every configured token under constant time. Don't early-exit
+	// on a match — a timing oracle on this fast path lets an attacker
+	// brute-force the bearer one byte at a time, which we already guard
+	// against on /v1/events via checkBearer.
+	matched := false
 	for _, allowed := range s.tokens {
-		if tok == allowed {
-			return true
+		if subtle.ConstantTimeCompare(tokBytes, []byte(allowed)) == 1 {
+			matched = true
 		}
 	}
-	return false
+	return matched
 }
 
 // addSecurityHeaders sets a small set of conservative response headers.
@@ -882,6 +919,16 @@ func (s *serverState) handleEvents(w http.ResponseWriter, r *http.Request) {
 		s.broadcastErr("server", fmt.Errorf("rejected unauthenticated request from %s claiming host=%q", r.RemoteAddr, host))
 		http.Error(w, "client certificate required", http.StatusUnauthorized)
 		return
+	} else {
+		// Bearer-only mode: identity is the X-SimpleSIEM-Host header
+		// because there's no cert CN. A second daemon presenting the
+		// same bearer token from a different IP claiming the same
+		// agent_id is the same duplicate-identity scenario the cert
+		// path catches; reject it just the same.
+		if !s.identityCheck(r, "bearer:"+host) {
+			http.Error(w, "duplicate identity: another daemon is currently active with this agent_id", http.StatusConflict)
+			return
+		}
 	}
 
 	// Allowlist gate. When non-empty, the agent ID MUST be on the list,

@@ -29,9 +29,9 @@ type identityRec struct {
 // authenticated request. Returns true to allow, false to reject;
 // the caller writes the HTTP response either way.
 //
-// First-seen CNs are recorded and allowed. Subsequent requests from
-// the SAME (CN, IP) update the timestamp. Requests with a DIFFERENT
-// IP arriving inside identityGuardWindow are rejected and an
+// First-seen identities are recorded and allowed. Subsequent requests
+// from the SAME (identity, IP) update the timestamp. Requests with a
+// DIFFERENT IP arriving inside identityGuardWindow are rejected and an
 // `identity_conflict` meta event is emitted into the per-host log so
 // an operator running `simplesiem triage --type meta` sees the event
 // without having to enable verbose logs.
@@ -40,11 +40,17 @@ type identityRec struct {
 // silent for a full minute — assume it died). This avoids permanent
 // blackholing when a host genuinely changes IP and its last
 // heartbeat was the disappearing one.
+//
+// Identity is the cert CN when mTLS is in use; in bearer-only mode the
+// caller passes "bearer:"+agent_id as the identity key so duplicate
+// agents present the same token from two different IPs is still
+// rejected.
 func (s *serverState) identityCheck(r *http.Request, cn string) bool {
 	if cn == "" {
-		// Bearer-token-only auth path doesn't have a cert identity to
-		// guard; the bearer token IS the identity. Skip the check.
-		return true
+		// Identity is required. Caller must pass a cert CN or a
+		// bearer-mode key — empty here means the auth layer didn't
+		// assign one, which is a programmer error.
+		return false
 	}
 	ip := remoteIP(r)
 	s.identityMu.Lock()

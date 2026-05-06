@@ -27,6 +27,9 @@ type alertEscalator struct {
 	dispatch       func(map[string]any)
 	mu             sync.Mutex
 	escalatedHash  map[string]time.Time
+	// startOnce protects against double-Start() spawning two scanner
+	// goroutines that would re-fire every escalation alert twice.
+	startOnce sync.Once
 }
 
 func newAlertEscalator(cfg ServerConfig, logDir, mode string, logger *Storage, dispatch func(map[string]any)) *alertEscalator {
@@ -58,26 +61,30 @@ func newAlertEscalator(cfg ServerConfig, logDir, mode string, logger *Storage, d
 	}
 }
 
-// Start launches the periodic escalation scan. Idempotent fire:
-// each alert hash escalates at most once per cooldown.
+// Start launches the periodic escalation scan. Idempotent in two
+// senses: each alert hash escalates at most once per cooldown, and
+// calling Start twice is a no-op (a second goroutine would re-fire
+// every escalation twice).
 func (e *alertEscalator) Start(ctx context.Context, wg *sync.WaitGroup) {
 	if e == nil {
 		return
 	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t := time.NewTicker(e.scanInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				e.scan()
+	e.startOnce.Do(func() {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			t := time.NewTicker(e.scanInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					e.scan()
+				}
 			}
-		}
-	}()
+		}()
+	})
 }
 
 // scan walks the alerts log for events older than escalateAfter,

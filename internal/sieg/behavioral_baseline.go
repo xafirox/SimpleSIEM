@@ -218,12 +218,18 @@ func (d *baselineDetector) persist() {
 		snap = append(snap, b)
 	}
 	d.mu.Unlock()
-	_ = os.MkdirAll(d.stateDir, 0o750)
+	if err := os.MkdirAll(d.stateDir, 0o750); err != nil {
+		return
+	}
+	data, err := json.Marshal(snap)
+	if err != nil {
+		// A marshal failure here means the in-memory model contains
+		// an unencodable type (channel, func) — that's a programmer
+		// error. Don't write empty bytes over a previously-good file.
+		return
+	}
 	path := filepath.Join(d.stateDir, "baseline.json")
-	data, _ := json.Marshal(snap)
-	tmp := path + ".tmp"
-	_ = os.WriteFile(tmp, data, 0o640)
-	_ = os.Rename(tmp, path)
+	_ = atomicWriteFile(path, data, 0o640)
 }
 
 func (d *baselineDetector) load() {

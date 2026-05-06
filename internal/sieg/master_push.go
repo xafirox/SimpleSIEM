@@ -49,7 +49,7 @@ func (s *serverState) handleMasterRotateCA(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.masterCanRotate {
+	if !s.masterCanRotate.Load() {
 		http.Error(w, "server.master_can_rotate_ca is false; rotation refused", http.StatusForbidden)
 		return
 	}
@@ -142,7 +142,7 @@ func (s *serverState) handleMasterFinalizeCA(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.masterCanRotate {
+	if !s.masterCanRotate.Load() {
 		http.Error(w, "server.master_can_rotate_ca is false; finalize refused", http.StatusForbidden)
 		return
 	}
@@ -235,7 +235,7 @@ func (s *serverState) handleMasterCAStatus(w http.ResponseWriter, r *http.Reques
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.masterCanRotate {
+	if !s.masterCanRotate.Load() {
 		http.Error(w, "server.master_can_rotate_ca is false", http.StatusForbidden)
 		return
 	}

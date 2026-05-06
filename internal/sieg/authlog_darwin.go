@@ -132,6 +132,10 @@ func (c *AuthLogCollector) loop(ctx context.Context) {
 			persist()
 			_ = cmd.Process.Kill()
 			<-scanDone
+			// Reap the subprocess so we don't leave a zombie holding a
+			// process slot. The kill above guarantees the wait returns;
+			// any error is expected and uninteresting.
+			_ = cmd.Wait()
 			return
 		case <-beat.C:
 			c.health.Beat("authlog")

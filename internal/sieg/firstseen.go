@@ -200,12 +200,17 @@ func (d *firstSeenDetector) persistIfDirty() {
 		}
 		snap[h] = fcp
 	}
-	d.dirty = false
 	d.mu.Unlock()
+	// Don't clear `dirty` until we've durably persisted. If WriteFile
+	// or Rename fails, the next tick will retry. Clearing the flag
+	// before the IO completes loses the in-memory state on the next
+	// restart when the IO never landed.
 	if d.stateDir == "" {
 		return
 	}
-	_ = os.MkdirAll(d.stateDir, 0o750)
+	if err := os.MkdirAll(d.stateDir, 0o750); err != nil {
+		return
+	}
 	path := filepath.Join(d.stateDir, "firstseen.json")
 	tmp := path + ".tmp"
 	data, err := json.Marshal(snap)
@@ -215,7 +220,13 @@ func (d *firstSeenDetector) persistIfDirty() {
 	if err := os.WriteFile(tmp, data, 0o640); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	d.mu.Lock()
+	d.dirty = false
+	d.mu.Unlock()
 }
 
 func (d *firstSeenDetector) load() {

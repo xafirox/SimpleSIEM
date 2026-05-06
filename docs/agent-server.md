@@ -126,7 +126,7 @@ To revoke an agent: remove its ID from `server.agent_allowlist` and restart. Fut
 - ECDSA P-384 keys throughout (~192-bit security, NIST Suite B Top Secret family). Hash chain + HMAC-SHA384. Key exchange is `X25519MLKEM768` only — the hybrid post-quantum KEM (NIST FIPS 203) — so a future quantum-era adversary holding captured TLS sessions can't recover the symmetric key offline. No classical fallback (no production deployments to preserve compatibility with).
 - Client and server private keys live on disk with mode 0600, owned by the user the daemon runs as.
 - Without explicit `bearer_tokens` configured server-side, mTLS alone authenticates the request — no shared secret to leak.
-- The agent `insecure_skip_tls` knob exists for first-boot debugging only; setting it emits a `meta:agent_insecure_tls` event so the lapse is visible in the audit trail.
+- The agent `insecure_skip_tls` knob exists for first-boot debugging only; setting it emits a `meta:agent_insecure_tls` event so the lapse is visible in the audit trail. The daemon ALSO requires the operator to export `SIMPLESIEM_ALLOW_INSECURE_TLS=1` in the daemon's environment for the flag to take effect — a tampered config alone refuses to start, so an attacker who flips the bit in `config.json` cannot silently downgrade the agent to plaintext.
 
 ## Resilience
 
@@ -255,7 +255,7 @@ Common server-mode keys (full list in [reference.md#server-mode-keys](reference.
 | `agent.spool_dir` | local NDJSON spool when the server is unreachable |
 | `agent.spool_max_mb` | spool ceiling; oldest batches drop when exceeded |
 | `agent.batch_size` / `batch_interval_seconds` | flush triggers |
-| `agent.insecure_skip_tls` | dev-only escape hatch; logs `meta:agent_insecure_tls` if set |
+| `agent.insecure_skip_tls` | dev-only escape hatch; logs `meta:agent_insecure_tls` if set. Requires `SIMPLESIEM_ALLOW_INSECURE_TLS=1` in the daemon environment OR the daemon refuses to start. |
 | `agent.failover_servers` | list of peer URLs to try when the primary is unreachable. Populated automatically on enrollment when the server is part of a realm. See [realms.md](realms.md) |
 
 ## Server-stamped fields

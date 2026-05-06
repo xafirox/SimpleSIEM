@@ -122,10 +122,10 @@ func collectIssues() []issue {
 		out = append(out, issue{
 			desc: "config file missing: " + cfgFile,
 			fix: func() error {
-				if err := os.MkdirAll(cfgDir, 0o755); err != nil {
+				if err := os.MkdirAll(cfgDir, 0o750); err != nil {
 					return err
 				}
-				return os.WriteFile(cfgFile, []byte(defaultConfigJSON()), 0o644)
+				return atomicWriteFile(cfgFile, []byte(defaultConfigJSON()), 0o600)
 			},
 		})
 	} else {
@@ -135,7 +135,7 @@ func collectIssues() []issue {
 				desc: fmt.Sprintf("config file is not valid JSON: %v", jerr),
 				fix: func() error {
 					_ = os.Rename(cfgFile, cfgFile+".broken")
-					return os.WriteFile(cfgFile, []byte(defaultConfigJSON()), 0o644)
+					return atomicWriteFile(cfgFile, []byte(defaultConfigJSON()), 0o600)
 				},
 			})
 		}

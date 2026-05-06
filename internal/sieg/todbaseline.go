@@ -164,19 +164,23 @@ func (d *todBaselineDetector) persistIfDirty() {
 		}
 		snap[h] = fcp
 	}
-	d.dirty = false
 	d.mu.Unlock()
-	_ = os.MkdirAll(d.stateDir, 0o750)
+	// Don't clear dirty until the on-disk write is durable; same
+	// rationale as firstseenDetector.persistIfDirty.
+	if err := os.MkdirAll(d.stateDir, 0o750); err != nil {
+		return
+	}
 	path := filepath.Join(d.stateDir, "tod_baselines.json")
-	tmp := path + ".tmp"
 	data, err := json.Marshal(snap)
 	if err != nil {
 		return
 	}
-	if err := os.WriteFile(tmp, data, 0o640); err != nil {
+	if err := atomicWriteFile(path, data, 0o640); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, path)
+	d.mu.Lock()
+	d.dirty = false
+	d.mu.Unlock()
 }
 
 func (d *todBaselineDetector) load() {

@@ -155,7 +155,11 @@ func installService(args []string) {
 		}
 	}
 	if _, err := os.Stat(cfgFile); os.IsNotExist(err) {
-		if err := os.WriteFile(cfgFile, []byte(configJSONForMode(*mode)), 0o644); err != nil {
+		// Mode 0o600 — the config can hold bearer_tokens, PSK paths,
+		// and webhook URLs; group/world read isn't appropriate.
+		// atomicWriteFile keeps a partial write from being visible
+		// if the daemon is racing the installer.
+		if err := atomicWriteFile(cfgFile, []byte(configJSONForMode(*mode)), 0o600); err != nil {
 			fatalf("write config: %v", err)
 		}
 		fmt.Println("wrote default config:", cfgFile, "(mode:", *mode+")")

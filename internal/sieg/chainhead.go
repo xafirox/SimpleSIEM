@@ -172,7 +172,22 @@ type signedChainHead struct {
 // appends the record to the chainhead log. Errors are logged via
 // the storage logger but otherwise silent — the next cycle retries.
 func (s *chainHeadSigner) signOnce() {
-	heads, err := scanChainHeads(s.logDir)
+	corruptCB := func(host, typ, file, reason string) {
+		// Surface a corrupt-tail finding so an operator notices the
+		// chain stopped advancing — silent skip would hide tampering
+		// that truncates the file or flips a single byte.
+		if s.logger != nil {
+			s.logger.Write("meta", map[string]any{
+				"event":  "chainhead_corrupt_tail",
+				"host":   host,
+				"type":   typ,
+				"file":   file,
+				"reason": reason,
+				"hint":   "last line of this JSONL file failed to parse; chainhead skipped this file. Investigate via `simplesiem verify` and check for truncation or tampering.",
+			})
+		}
+	}
+	heads, err := scanChainHeads(s.logDir, corruptCB)
 	if err != nil {
 		if s.logger != nil {
 			s.logger.Write("errors", map[string]any{
@@ -232,9 +247,10 @@ func (s *chainHeadSigner) signOnce() {
 // scanChainHeads walks log_dir for every host/type/date.jsonl file
 // and reads the last JSON line to extract its `_seq` and `_hash`.
 // Skips `_chainhead/`, `_acks/`, `.from-*.jsonl` (replicated chains
-// belong to their origin), and any file whose last line isn't valid
-// JSON.
-func scanChainHeads(logDir string) ([]chainHeadEntry, error) {
+// belong to their origin). Files whose last line failed to parse are
+// reported via the corrupt callback so a rotting chain doesn't silently
+// disappear from the audit.
+func scanChainHeads(logDir string, onCorrupt func(host, typ, file, reason string)) ([]chainHeadEntry, error) {
 	var heads []chainHeadEntry
 	hosts, err := os.ReadDir(logDir)
 	if err != nil {
@@ -279,8 +295,11 @@ func scanChainHeads(logDir string) ([]chainHeadEntry, error) {
 				// date prefix for the entry.
 				date := strings.SplitN(name, ".", 2)[0]
 				path := filepath.Join(typeDir, name)
-				seq, hash := readLastLineHashSeq(path)
+				seq, hash, reason := readLastLineHashSeq(path)
 				if hash == "" {
+					if reason != "" && reason != "empty" && onCorrupt != nil {
+						onCorrupt(hostName, typeName, name, reason)
+					}
 					continue
 				}
 				heads = append(heads, chainHeadEntry{
@@ -311,17 +330,26 @@ func scanChainHeads(logDir string) ([]chainHeadEntry, error) {
 
 // readLastLineHashSeq tail-reads one JSONL file and extracts the last
 // non-empty line's `_seq` and `_hash` fields. Cheap — uses a small
-// buffer + seek-from-end. Returns ("", 0) on any read or parse error
-// so the caller skips this file.
-func readLastLineHashSeq(path string) (uint64, string) {
+// buffer + seek-from-end.
+//
+// Return values:
+//   - seq, hash, "" — successful parse.
+//   - 0, "", "empty" — file is empty (legitimately new / freshly rotated).
+//   - 0, "", "<reason>" — the last line was unparseable. Caller should
+//     surface this so a corrupt chain doesn't silently disappear from
+//     the chainhead audit.
+func readLastLineHashSeq(path string) (uint64, string, string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return 0, ""
+		return 0, "", "open: " + err.Error()
 	}
 	defer f.Close()
 	fi, err := f.Stat()
-	if err != nil || fi.Size() == 0 {
-		return 0, ""
+	if err != nil {
+		return 0, "", "stat: " + err.Error()
+	}
+	if fi.Size() == 0 {
+		return 0, "", "empty"
 	}
 	// Read up to the last 64 KiB — enough for the longest realistic
 	// final line. If the file's last line straddles 64 KiB we fall
@@ -333,7 +361,7 @@ func readLastLineHashSeq(path string) (uint64, string) {
 	}
 	buf := make([]byte, fi.Size()-start)
 	if _, err := f.ReadAt(buf, start); err != nil {
-		return 0, ""
+		return 0, "", "read: " + err.Error()
 	}
 	// Trim trailing newline so SplitAfter's last segment is the line
 	// we want, not an empty string after the final \n.
@@ -347,9 +375,12 @@ func readLastLineHashSeq(path string) (uint64, string) {
 	}
 	var obj map[string]any
 	if err := json.Unmarshal([]byte(last), &obj); err != nil {
-		return 0, ""
+		return 0, "", "json: " + err.Error()
 	}
 	hash, _ := obj["_hash"].(string)
+	if hash == "" {
+		return 0, "", "missing _hash"
+	}
 	var seq uint64
 	switch v := obj["_seq"].(type) {
 	case float64:
@@ -358,7 +389,7 @@ func readLastLineHashSeq(path string) (uint64, string) {
 		n, _ := v.Int64()
 		seq = uint64(n)
 	}
-	return seq, hash
+	return seq, hash, ""
 }
 
 // appendChainHeadRecord writes one signed record to

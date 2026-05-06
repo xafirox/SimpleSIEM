@@ -140,16 +140,15 @@ func (w *configWatcher) applyOnce() {
 	}
 	s.revokedMu.Unlock()
 
-	// master_can_rotate_ca: simple bool swap.
-	rotateChanged := s.masterCanRotate != cfg.Server.MasterCanRotateCA
-	s.masterCanRotate = cfg.Server.MasterCanRotateCA
+	// master_can_rotate_ca: atomic swap so HTTP handlers reading the
+	// gate can never observe a torn write.
+	rotateChanged := s.masterCanRotate.Swap(cfg.Server.MasterCanRotateCA) != cfg.Server.MasterCanRotateCA
 
 	// master_can_uninstall: same shape — operator can flip without
 	// daemon restart, configWatcher applies the change so a fleet-
 	// wide cascade-uninstall opt-in takes effect within ~1s of
 	// editing config.json.
-	uninstallChanged := s.masterCanUninstall != cfg.Server.MasterCanUninstall
-	s.masterCanUninstall = cfg.Server.MasterCanUninstall
+	uninstallChanged := s.masterCanUninstall.Swap(cfg.Server.MasterCanUninstall) != cfg.Server.MasterCanUninstall
 
 	// Realm name + version: operator's `simplesiem realm rename`
 	// writes to config.json; without this branch the daemon's
@@ -199,20 +198,26 @@ func (w *configWatcher) applyOnce() {
 			"hint":  "config.json changed on disk; in-memory state refreshed",
 		}
 		if allowChanged {
+			s.allowlistMu.RLock()
 			fields["allowlist_size"] = len(s.allowlist)
+			s.allowlistMu.RUnlock()
 		}
 		if masterChanged {
+			s.masterMu.RLock()
 			fields["master_cns_size"] = len(s.masterCNs)
+			s.masterMu.RUnlock()
 		}
 		if revokedChanged {
+			s.revokedMu.RLock()
 			fields["revoked_agents"] = len(s.agentRevoked)
 			fields["revoked_masters"] = len(s.masterRevoked)
+			s.revokedMu.RUnlock()
 		}
 		if rotateChanged {
-			fields["master_can_rotate_ca"] = s.masterCanRotate
+			fields["master_can_rotate_ca"] = s.masterCanRotate.Load()
 		}
 		if uninstallChanged {
-			fields["master_can_uninstall"] = s.masterCanUninstall
+			fields["master_can_uninstall"] = s.masterCanUninstall.Load()
 		}
 		if realmNameChanged {
 			fields["realm_name"] = newRealmName

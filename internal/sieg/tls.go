@@ -131,12 +131,28 @@ func loadKeyPair(certPath, keyPath string) (tls.Certificate, error) {
 // keypair files on disk) takes effect on the next reconnection without
 // the agent having to recreate its http.Transport.
 func agentTLSConfig(cfg AgentConfig) (*tls.Config, error) {
-	caPool, err := loadCAPool(cfg.CACert)
-	if err != nil {
-		return nil, err
+	// Check the InsecureSkipTLS gate FIRST so a tampered config.json
+	// can't pass the dev-only escape hatch through the env-var check
+	// just because there happens to be no CA file on disk yet. The
+	// gate is the sole authority for "is the dangerous setting
+	// actually permitted on this host."
+	if cfg.InsecureSkipTLS && os.Getenv("SIMPLESIEM_ALLOW_INSECURE_TLS") != "1" {
+		return nil, fmt.Errorf("agent.insecure_skip_tls=true rejected: set SIMPLESIEM_ALLOW_INSECURE_TLS=1 in the daemon environment to opt in (dev only)")
 	}
-	if _, err := loadKeyPair(cfg.ClientCert, cfg.ClientKey); err != nil {
-		return nil, fmt.Errorf("client keypair: %w", err)
+	var caPool *x509.CertPool
+	if !cfg.InsecureSkipTLS {
+		// Normal mTLS posture: a CA pool is required to verify the
+		// server's cert. The dev-only insecure path skips this load
+		// because the typical insecure_skip_tls user has not yet
+		// enrolled and has no CA file on disk.
+		var err error
+		caPool, err = loadCAPool(cfg.CACert)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := loadKeyPair(cfg.ClientCert, cfg.ClientKey); err != nil {
+			return nil, fmt.Errorf("client keypair: %w", err)
+		}
 	}
 	certPath := cfg.ClientCert
 	keyPath := cfg.ClientKey
@@ -145,6 +161,17 @@ func agentTLSConfig(cfg AgentConfig) (*tls.Config, error) {
 		CurvePreferences: pqHybridCurvePrefs(),
 		RootCAs:          caPool,
 		GetClientCertificate: func(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			// In insecure-skip mode the agent often has no client
+			// cert yet either; return an empty cert so the handshake
+			// proceeds without one.
+			if cfg.InsecureSkipTLS {
+				if certPath == "" || keyPath == "" {
+					return &tls.Certificate{}, nil
+				}
+				if _, err := os.Stat(certPath); err != nil {
+					return &tls.Certificate{}, nil
+				}
+			}
 			cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 			if err != nil {
 				return nil, err
@@ -153,9 +180,6 @@ func agentTLSConfig(cfg AgentConfig) (*tls.Config, error) {
 		},
 	}
 	if cfg.InsecureSkipTLS {
-		// Documented escape hatch for first-time bring-up only. The config
-		// loader emits a meta:agent_insecure event when this is set so the
-		// posture is visible in the audit log.
 		out.InsecureSkipVerify = true
 	}
 	return out, nil

@@ -298,7 +298,7 @@ func (s *serverState) handleMasterPushRealmRename(w http.ResponseWriter, r *http
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.masterCanRotate {
+	if !s.masterCanRotate.Load() {
 		http.Error(w, "server.master_can_rotate_ca is false; master push refused", http.StatusForbidden)
 		return
 	}

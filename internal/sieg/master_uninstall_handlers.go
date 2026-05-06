@@ -31,7 +31,7 @@ func (s *serverState) handleMasterUninstallSelf(w http.ResponseWriter, r *http.R
 		http.Error(w, "not a recognised peer", http.StatusForbidden)
 		return
 	}
-	if !s.masterCanUninstall {
+	if !s.masterCanUninstall.Load() {
 		http.Error(w, "server.master_can_uninstall is false; remote uninstall refused", http.StatusForbidden)
 		return
 	}

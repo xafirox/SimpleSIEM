@@ -356,6 +356,13 @@ func (st *networkIngestState) handleFrameInner(raw, sourceIP string, viaTLS bool
 		unauthReason = "cleartext_refused"
 	case exact:
 		authenticated = true
+	case ipOnly && entry != nil && entry.TLSRequired && !viaTLS:
+		// IP matches a TLS-required vendor entry but MAC doesn't —
+		// double-fail: a cleartext frame from an untrusted MAC
+		// claiming a TLS-required vendor's IP is the worst combo.
+		// Surface the stricter reason so operators see the TLS
+		// violation rather than just "MAC mismatch".
+		unauthReason = "cleartext_refused"
 	case ipOnly:
 		unauthReason = "mac_mismatch"
 	default:

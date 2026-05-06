@@ -168,7 +168,7 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 		},
 		func() []*alertRule { return loadMasterRules(cfg) },
 		func(alert map[string]any) {
-			for _, h := range masterStore.alertHooks {
+			for _, h := range masterStore.SnapshotAlertHooks() {
 				h(alert)
 			}
 		}); err != nil {

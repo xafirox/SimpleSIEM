@@ -57,7 +57,7 @@ func (s *serverState) handleMasterPushRules(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	if !s.masterCanRotate {
+	if !s.masterCanRotate.Load() {
 		http.Error(w, "server.master_can_rotate_ca is false; master push refused", http.StatusForbidden)
 		return
 	}
@@ -124,13 +124,16 @@ func (s *serverState) handleMasterPushRules(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "write rules: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// Hot-reload: setRules on every per-host Storage we already have.
+	// Hot-reload: replace the active rule set, then propagate to every
+	// per-host Storage we've already opened. The setRules helper takes
+	// rulesMu so the netingest listener and storageFor see a stable
+	// slice through the swap.
+	s.setRules(rules)
 	s.mu.Lock()
 	for _, st := range s.storages {
 		st.SetRules(rules)
 	}
 	s.mu.Unlock()
-	s.rules = rules
 
 	if mst, gerr := s.storageFor("_server"); gerr == nil {
 		mst.Write("meta", map[string]any{

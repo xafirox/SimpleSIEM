@@ -711,6 +711,16 @@ func (s *serverState) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "duplicate identity: another daemon is currently active with this cert", http.StatusConflict)
 			return
 		}
+	} else if s.allowBearerOnly {
+		// Bearer-only path: the X-SimpleSIEM-Host header carries the
+		// agent identity. Run the same dedup so two daemons sharing a
+		// leaked token can't both heartbeat from different IPs.
+		if hostID := r.Header.Get("X-SimpleSIEM-Host"); hostID != "" && safeHostName(s.base, hostID) {
+			if !s.identityCheck(r, "bearer:"+hostID) {
+				http.Error(w, "duplicate identity: another daemon is currently active with this agent_id", http.StatusConflict)
+				return
+			}
+		}
 	}
 	resp := HeartbeatResponse{
 		OK:            true,

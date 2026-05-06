@@ -193,19 +193,25 @@ func (m *tupleManager) Persist() {
 		for k, t := range set.seen {
 			snap[k] = t.Format(time.RFC3339Nano)
 		}
-		set.dirty = false
 		set.mu.Unlock()
-
-		path := filepath.Join(m.stateDir, set.name+".json")
-		tmp := path + ".tmp"
-		data, _ := json.Marshal(map[string]any{
+		// Don't clear `dirty` until the state is durably on disk. If
+		// the marshal/write/rename fails, the next tick retries; we
+		// must NOT acknowledge a write that didn't land.
+		data, err := json.Marshal(map[string]any{
 			"name":   set.name,
 			"fields": set.fields,
 			"seen":   snap,
 		})
-		if err := os.WriteFile(tmp, data, 0o640); err == nil {
-			_ = os.Rename(tmp, path)
+		if err != nil {
+			continue
 		}
+		path := filepath.Join(m.stateDir, set.name+".json")
+		if err := atomicWriteFile(path, data, 0o640); err != nil {
+			continue
+		}
+		set.mu.Lock()
+		set.dirty = false
+		set.mu.Unlock()
 	}
 }
 

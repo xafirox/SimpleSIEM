@@ -121,7 +121,7 @@ func TestChainHead_SkipsReplicatedFiles(t *testing.T) {
 	mkfile("agent-a/auth/2026-05-02.jsonl", line)
 	mkfile("agent-a/auth/2026-05-02.from-peer-b.jsonl", line)
 
-	heads, err := scanChainHeads(logDir)
+	heads, err := scanChainHeads(logDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -83,6 +83,11 @@ type Storage struct {
 	// daemon startup. Order is insertion order; sinks must be cheap and
 	// non-blocking — Storage holds no lock during dispatch but the
 	// writer goroutine waits for each call to return.
+	//
+	// hooksMu guards the slice so hooks installed after the first alert
+	// fires (e.g. a webhook dispatcher attached after the metrics hook)
+	// can't race a writer-goroutine iteration.
+	hooksMu    sync.RWMutex
 	alertHooks []func(alert map[string]any)
 
 	// originServer, when non-empty, is stamped onto every event as
@@ -645,8 +650,12 @@ func (s *Storage) evaluateRules(logType string, event map[string]any) {
 		// alert is durably on disk. Order matters: a sink failure
 		// must never lose the alert. Sinks are expected to be
 		// non-blocking (queue-based), so this doesn't add latency
-		// to the writer goroutine.
-		for _, h := range s.alertHooks {
+		// to the writer goroutine. Snapshot under hooksMu so
+		// concurrent AddAlertHook calls can't tear the iteration.
+		s.hooksMu.RLock()
+		hooks := s.alertHooks
+		s.hooksMu.RUnlock()
+		for _, h := range hooks {
 			h(alert)
 		}
 	}
@@ -666,24 +675,46 @@ func (s *Storage) EvaluateRules(logType string, event map[string]any) {
 	s.evaluateRules(logType, event)
 }
 
+// SnapshotAlertHooks returns a stable snapshot of the alert-hook slice
+// for callers that fan an external alert through the same set of sinks
+// the writer goroutine uses (e.g. master rule eval, network-ingest
+// listener, alert escalation watcher).
+func (s *Storage) SnapshotAlertHooks() []func(map[string]any) {
+	if s == nil {
+		return nil
+	}
+	s.hooksMu.RLock()
+	defer s.hooksMu.RUnlock()
+	return s.alertHooks
+}
+
 // AddAlertHook appends a sink to the per-Storage alert fan-out list.
-// Caller-set at daemon startup; not safe to mutate while writes are
-// in flight. Used by the webhook + syslog dispatchers.
+// Safe to call after the writer is running — hooksMu serialises the
+// append against the writer's snapshot read.
 func (s *Storage) AddAlertHook(f func(map[string]any)) {
 	if f == nil {
 		return
 	}
-	s.alertHooks = append(s.alertHooks, f)
+	s.hooksMu.Lock()
+	// Copy-on-write: keep any iterator snapshot stable while the
+	// writer is mid-dispatch. Cheap because hooks are rare and small.
+	next := make([]func(map[string]any), len(s.alertHooks)+1)
+	copy(next, s.alertHooks)
+	next[len(s.alertHooks)] = f
+	s.alertHooks = next
+	s.hooksMu.Unlock()
 }
 
 // SetAlertHook is the legacy single-hook API kept for callers that only
 // install one sink. Replaces any previously-set hooks.
 func (s *Storage) SetAlertHook(f func(map[string]any)) {
+	s.hooksMu.Lock()
 	if f == nil {
 		s.alertHooks = nil
-		return
+	} else {
+		s.alertHooks = []func(map[string]any){f}
 	}
-	s.alertHooks = []func(map[string]any){f}
+	s.hooksMu.Unlock()
 }
 
 func (s *Storage) Close() {

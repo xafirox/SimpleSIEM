@@ -43,10 +43,22 @@ func parseSyslog(raw string) syslogFrame {
 	f := syslogFrame{RawMessage: raw, Message: raw}
 	// Try RFC 5424 first.
 	if m := rfc5424Re.FindStringSubmatch(raw); m != nil {
-		pri, _ := strconv.Atoi(m[1])
+		pri, perr := strconv.Atoi(m[1])
+		// RFC 5424: PRI is 0..191 (facility 0..23 << 3 | severity 0..7).
+		// Anything outside that range is a malformed/forged frame; clamp
+		// to the invalid sentinel (-1) instead of letting facility/severity
+		// land in fictional territory like facility=124 from <999>.
+		if perr != nil || pri < 0 || pri > 191 {
+			pri = -1
+		}
 		f.Priority = pri
-		f.Facility = pri / 8
-		f.Severity = pri % 8
+		if pri >= 0 {
+			f.Facility = pri / 8
+			f.Severity = pri % 8
+		} else {
+			f.Facility = -1
+			f.Severity = -1
+		}
 		f.Timestamp = normaliseRFC5424Timestamp(m[2])
 		f.Hostname = blankNil(m[3])
 		f.AppName = blankNil(m[4])
@@ -60,10 +72,18 @@ func parseSyslog(raw string) syslogFrame {
 		return f
 	}
 	if m := rfc3164Re.FindStringSubmatch(raw); m != nil {
-		pri, _ := strconv.Atoi(m[1])
+		pri, perr := strconv.Atoi(m[1])
+		if perr != nil || pri < 0 || pri > 191 {
+			pri = -1
+		}
 		f.Priority = pri
-		f.Facility = pri / 8
-		f.Severity = pri % 8
+		if pri >= 0 {
+			f.Facility = pri / 8
+			f.Severity = pri % 8
+		} else {
+			f.Facility = -1
+			f.Severity = -1
+		}
 		f.Timestamp = normaliseRFC3164Timestamp(m[2])
 		f.Hostname = m[3]
 		f.Message = strings.TrimSpace(m[4])
@@ -138,8 +158,13 @@ func normaliseRFC3164Timestamp(s string) string {
 // severityWord maps RFC 5424 numeric severity to a word the rule
 // engine and alerts pipeline expect. Mapped onto SimpleSIEM severity
 // levels: critical (0..2), high (3), medium (4..5), low (6..7).
+// A negative value means PRI was missing or out-of-range; we surface
+// that as "low" rather than letting a malformed frame impersonate
+// critical severity.
 func severityWord(sev int) string {
 	switch {
+	case sev < 0:
+		return "low"
 	case sev <= 2:
 		return "critical"
 	case sev == 3:
