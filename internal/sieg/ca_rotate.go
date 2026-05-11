@@ -174,7 +174,7 @@ func performCARotation(cfg Config, years int) (CARotationResult, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "SimpleSIEM CA (rotated " + stamp + ")", Organization: []string{"SimpleSIEM"}},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotBefore:             time.Now().Add(-24 * time.Hour),
 		NotAfter:              time.Now().AddDate(years, 0, 0),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
 		BasicConstraintsValid: true,

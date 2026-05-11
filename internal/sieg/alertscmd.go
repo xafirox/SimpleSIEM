@@ -99,12 +99,17 @@ func runAlertsCmd(args []string) {
 	if *unackedOnly {
 		suffix = "  (unacked only)"
 	}
-	fmt.Printf("%d alerts in %s -> %s  (%s)%s\n",
+	// Header: "1 alerts in 2026-05-05T10:00-04:00 -> 2026-05-05T11:00-04:00  (times shown in EDT)".
+	// The displayTS hop converts UTC -> host-local; the explicit "times
+	// shown in TZ" footer + the per-row TZ suffix together remove any
+	// doubt about whether the operator is reading UTC or local clock.
+	fmt.Printf("%d alerts in %s -> %s  (times shown in %s)%s\n",
 		len(events), displayTS(start).Format(time.RFC3339), displayTS(end).Format(time.RFC3339), displayTZ(), suffix)
 	if len(events) == 0 {
 		return
 	}
 	fmt.Println(strings.Repeat("-", 78))
+	tz := displayTZ()
 	for _, e := range events {
 		sev := strField(e.Data, "severity")
 		rule := strField(e.Data, "rule")
@@ -112,7 +117,7 @@ func runAlertsCmd(args []string) {
 		me := strField(e.Data, "matched_event")
 		host := strField(e.Data, "host")
 		hash := strField(e.Data, "_hash")
-		ts := displayTS(e.TS).Format("2006-01-02 15:04:05")
+		ts := displayTS(e.TS).Format("2006-01-02 15:04:05") + " " + tz
 		hostPart := ""
 		if host != "" {
 			hostPart = " host=" + host

@@ -43,7 +43,14 @@ simplesiem <command> [flags]
 
   query  [flags]         Raw JSONL filter (--type, --since, --until, --grep, --field, --limit, --host).
                          --format json (default) | csv | tsv ; --csv-fields ts,event,host[,...]
-  triage [flags]         Timeline reconstruction around a pivot
+                         Built-in jq replacement (no external dependency on Linux/Mac/Windows):
+                           --pretty                  multi-line indented JSON   (≈ jq .)
+                           --select event,user[,...] field-allowlist projection (≈ jq '{a,b}')
+                           --get .nested.field       single-value extract       (≈ jq -r '.a.b')
+                                                     supports array index: --get .members.0
+  triage [flags]         Timeline reconstruction around a pivot. The --json mode
+                         accepts the same --pretty / --select / --get flags as
+                         `query` so Windows operators don't need to install jq.
   tail   [flags]         Follow new events live (--type, --grep, --alerts, --json, --host)
   alerts [flags]         Pretty list of recent rule matches (--since, --severity, --host).
                          --unacked-only filters to alerts with no ack record.
@@ -183,7 +190,53 @@ simplesiem <command> [flags]
   incidents list|show|config|status     (#6) Inspect grouped incidents; configure
                               the grouping window (refused on server with master).
   threatintel status                    (#4) Show feed configuration + cache age.
+  threatintel feed new <id>             Stepwise feed builder. Draft starts disabled;
+  threatintel feed set <id> kind <K>      operators set fields one at a time. Each
+  threatintel feed set <id> url <https://...>     value is validated immediately
+  threatintel feed set <id> interval-hours <N>    (URL must be http(s); confidence
+  threatintel feed set <id> min-confidence <0..100>   must be 0..100; etc.).
+  threatintel feed set <id> max-age-days <N>
+  threatintel feed kinds <id> add|remove|set <kind[,kind,...]>
+                                          Manage indicator-kinds list (ip:port,
+                                          domain, sha256, url, ...).
+  threatintel feed validate <id>          Dry-run audit (URL, kinds, intervals).
+  threatintel feed enable <id>            Audits required fields, refuses on
+                                          incomplete drafts (lists every problem).
+  threatintel feed disable <id>           Keep entry but stop fetching.
+  threatintel feed delete <id>            Remove from cfg.threatintel.feeds.
+  threatintel feed list|show <id>         Inventory.
+
   firstseen status                      (#7) Show configured tuples + entry counts.
+  firstseen tuple add <id> <f1>,<f2>,... Stepwise tuple definition. Field names
+                                          must match [A-Za-z0-9._-]+; daemon
+                                          emits meta:first_seen_tuple the first
+                                          time a (host, tuple-key) is observed.
+  firstseen tuple fields <id> <f1>,<f2>... Rewrite the field list for an existing tuple.
+  firstseen tuple remove <id>             Drop a tuple definition.
+  firstseen tuple list|show <id>          Inventory.
+
+  attack-patterns new <id>              Stepwise builder for the operator-extensible
+  attack-patterns set <id> regex <pat>    pattern set the network-ingest detector
+  attack-patterns set <id> tactic <ID>    runs alongside its hardcoded core. Each
+  attack-patterns set <id> technique <ID>   set validates the value (regex must
+  attack-patterns set <id> description "..."  compile under Go's RE2; MITRE IDs
+                                          must look like real ATT&CK IDs).
+  attack-patterns validate <id>           Dry-run audit; never modifies the entry.
+  attack-patterns enable <id>             Refuses on incomplete drafts; activates
+                                          on the next sidecar reload (~1s).
+  attack-patterns disable <id>            Keep entry but stop matching.
+  attack-patterns delete <id>             Remove from <config>/attack-patterns.json.
+  attack-patterns test <id> "<frame>"     Match the regex against a literal frame —
+                                          read-only, for tuning before enable.
+  attack-patterns list|show <id>          Inventory.
+
+  certs unrevoke <agent-id|master-cn>   Record this peer's intent to undo a
+                                          revocation. Quorum is ⌈peers/2⌉+1; every
+                                          realm peer must run the same command
+                                          (or vote via their own operators) before
+                                          the tombstone is dropped.
+  certs unrevoke list                     Show pending intents on this peer.
+  certs unrevoke clear <id>               Withdraw this peer's intent.
   mitre catalog|coverage|fetch|disable  (#8 Phase 1) MITRE ATT&CK auto-catalog + coverage.
   mitre generate-rules [--reject <id>] [--include <id>] [--list-templates]
                               (#8 Phase 2) Instantiate the curated
@@ -469,11 +522,11 @@ With `--dry-run`, only reports — doesn't change anything. Exit code is non-zer
     "rate_per_second": 200,
     "rate_burst": 400,
     "max_clock_skew_seconds": 300,
-    "agent_reauth_seconds": 60,
+    "agent_reauth_seconds": 15,
     "realm": {
       "name": "default",
       "peers": [],
-      "sync_interval_seconds": 60,
+      "sync_interval_seconds": 15,
       "master_url": "",
       "config_version": 0
     }
@@ -498,7 +551,7 @@ With `--dry-run`, only reports — doesn't change anything. Exit code is non-zer
 | `retention_days` | days | rolling retention window; older daily files are deleted |
 | `network_interval` | seconds | connection-table poll interval |
 | `dns_cache_ttl` | seconds | reverse-DNS cache TTL |
-| `file_watch_paths` | list of paths | directories watched via fsnotify |
+| `file_watch_paths` | list of paths | directories watched via fsnotify. Defaults are platform-specific. **Linux**: `/etc /root /home /tmp /var/tmp /opt /srv /app /workspace /usr/local/{bin,sbin} /var/spool/{cron,at} /lib/systemd/system /usr/lib/systemd/system /usr/local/lib/systemd/system`. **macOS**: `/etc /private/etc /Users /tmp /var/tmp /opt /usr/local/{bin,sbin,etc} /Library/{LaunchDaemons,LaunchAgents} /System/Library/{LaunchDaemons,LaunchAgents}`. **Windows**: narrow set of high-value paths (`Windows\System32\drivers\etc`, `Windows\System32\Tasks`, `ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp`, `Windows\System32\WindowsPowerShell\v1.0\profile.ps1`, `Windows\Temp`) PLUS per-user profile dirs enumerated under `C:\Users\<profile>\` at install time: `Downloads`, `Desktop`, `Documents`, `AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`. System metadata profiles (`Default`, `Public`, `defaultuser*`) are skipped. **Hot-reload note:** `file_watch_paths` is NOT picked up live by the FileCollector — `simplesiem watch add/remove <path>` writes to config.json and prints a one-line warning that a daemon restart is required for the new path to be watched. |
 | `file_watch_recursive` | bool | add subdirectories as they appear |
 | `file_poll_interval` | seconds | (reserved for future polling-fallback) |
 | `auth_interval` | seconds | login-session diff interval |
@@ -584,10 +637,10 @@ The storage controller probes the active volume every 30 s with a 5 s shared cac
 | `server.rate_per_second` | per-IP token-bucket fill rate (req/s); 0 disables |
 | `server.rate_burst` | per-IP token-bucket capacity; bursts up to this size are allowed |
 | `server.max_clock_skew_seconds` | accept agent timestamps within ±this many seconds; outside the window the ts is clamped to `now` and `clock_skewed:true` is recorded |
-| `server.agent_reauth_seconds` | how often agents must hit `/v1/heartbeat` to renew their session. Default 60s. Changes propagate to agents via the heartbeat response. |
+| `server.agent_reauth_seconds` | how often agents must hit `/v1/heartbeat` to renew their session. Default 15s. Changes propagate to agents via the heartbeat response. |
 | `server.realm.name` | realm identifier; default `"default"`. Operators can rename from any peer; the rename propagates via `/v1/sync/config`. |
 | `server.realm.peers` | list of peer server URLs in this realm. Each peer pulls events from every other peer on `sync_interval_seconds`. Empty = single-server realm. |
-| `server.realm.sync_interval_seconds` | how often peers replicate logs and reconcile realm config; default 60. |
+| `server.realm.sync_interval_seconds` | how often peers replicate logs and reconcile realm config; default 15. |
 | `server.realm.master_url` | optional URL of a master that owns this realm. Reserved — master config push is not yet enforced. |
 | `server.realm.config_version` | unix-nanos timestamp used by the last-write-wins reconciliation in `/v1/sync/config`. Set automatically. |
 | `server.alert_webhooks` | list of HTTPS URLs that receive a POST per fired alert (JSON body). Empty (default) = no webhooks. Network failures and 5xx are retried with exponential backoff (1 s / 4 s / 16 s); 4xx is treated as a permanent reject and not retried. Drops on overflow are summarised in a `meta:alert_webhook_drops` event every 30 s rather than blocking the alert path. |
@@ -851,28 +904,45 @@ Agents writing to a standalone-mode local store don't get these extra fields.
 
 | Field | Example | Notes |
 |---|---|---|
-| `event` | `connection_open` / `connection_close` | |
-| `status` | `ESTABLISHED` / `LISTEN` / `SYN_SENT` / `TIME_WAIT` | |
-| `protocol` | `tcp` / `udp` | |
+| `event` | `connection_open` / `connection_close` / `connection_dns_resolved` / `tool_invocation` | |
+| `status` | `ESTABLISHED` / `LISTEN` / `SYN_SENT` / `TIME_WAIT` / `ACTIVE` / `cmdline` | conntrack-state strings appear when sourced from `/proc/net/nf_conntrack` |
+| `protocol` | `tcp` / `udp` / `icmp` / `icmpv6` / `raw` / `cmdline` | `cmdline` is the synthesized `tool_invocation` shape; everything else is a real socket-observed flow |
 | `local` | `10.0.0.5:51234` | |
-| `remote` | `140.82.114.4:443` | |
+| `remote` | `140.82.114.4:443` | for `tool_invocation`, this is the cmdline-extracted host (e.g. `google.com`) |
 | `remote_host` | `github.com` | reverse-DNS, falls back to `1.1.1.1` resolver in containers |
 | `pid`, `process`, `user`, `cmdline` | owning process | |
 | `cmdline_hosts` | `["api.github.com"]` | hostnames extracted from cmdline when PTR fails |
 | `duration_s` | `4.213` | close events only |
+| `source` | `conntrack` / `icmp` / `icmpv6` / `raw` / `raw6` | which kernel table populated this row (Linux extra-conn path) |
+| `tool` | `ping` / `curl` / `ssh` / `dig` / ... | `tool_invocation` events only |
 
 In display (`triage`, `tail`, `alerts`), known providers (Google, AWS, Cloudflare, GitHub, Canonical, ...) are labelled inline: `Google [ym-in-f113.1e100.net] (108.177.122.113:80)`.
+
+**Source-of-data layering**: `NetworkCollector` polls multiple kernel surfaces every `network_interval` (default 2s) and merges them with cmdline-driven synthesis:
+
+1. **`gopsutil.Connections("inet")`** — TCP / UDP via `/proc/net/{tcp,udp}`. Cross-platform.
+2. **`/proc/net/icmp` + `/proc/net/icmp6` + `/proc/net/raw` + `/proc/net/raw6`** (Linux only) — catches `ping` and other ICMP/raw socket destinations the gopsutil enumeration misses. Implemented via direct `/proc` parsing in `internal/sieg/conntrack_linux.go` — no shell-out, no CGO.
+3. **`/proc/net/nf_conntrack`** (Linux only, when `nf_conntrack` module is loaded) — every flow with src+dst, including ICMP entries that linger after the socket closes (~30s default). Skipped silently on hosts without the module (LinuxKit / Docker Desktop).
+4. **`tool_invocation` synthesis** (cross-platform) — when `ProcessCollector` sees `process_start` for a recognised network tool (`ping`, `curl`, `ssh`, `dig`, `traceroute`, `wget`, `nslookup`, `host`, `nc`/`netcat`/`ncat`, `socat`, `telnet`, `scp`, `sftp`, `mtr`, `ping6`, `traceroute6`, `tracepath`, `drill`, `openssl`), emits a synthesized `connection_open` with `protocol="cmdline"` and the destination from `cmdline_hosts`. Closes the gap that `ping -c1 google.com` (~15ms) creates — even when the kernel socket table never sees it, the cmdline carries the host and it lands in `network`.
+5. **NETLINK_CONNECTOR PROC_EVENTS** (Linux only, real Linux kernels with `CONFIG_PROC_EVENTS=y`) — real-time fork/exec notifications via netlink. Catches sub-poll-interval processes instantly. Falls back to `process_interval` polling on Docker Desktop's LinuxKit kernel (no `CONFIG_CONNECTOR`) — emits `meta:proc_events_listener_unavailable` so the operator knows. Pure Go via `golang.org/x/sys/unix`.
 
 ### `dns`
 
 | Field | Example | Notes |
 |---|---|---|
-| `event` | `lookup` | always `lookup` today |
-| `remote_host` | `github.com` | the hostname `network` collector observed for a remote IP |
-| `remote_ip` | `140.82.114.4` | resolved address |
+| `event` | `lookup` / `query` | `lookup` = reverse-PTR observed; `query` = forward DNS request observed |
+| `remote_host` | `github.com` | the hostname `network` collector observed for a remote IP (`lookup` path) |
+| `remote_ip` | `140.82.114.4` | resolved address (`lookup` path) |
+| `query` | `github.com` | the queried name (`query` path), extracted from cmdline_hosts |
+| `resolver` | `1.1.1.1` | the resolver IP the process dialled (`query` path) |
 | `process`, `user` | owning process | |
 
-Synthesized by `NetworkCollector` when a previously-unseen `(remote_host, process)` tuple appears in the current 1-hour dedupe window. Captures the spirit of "DNS query logging" without per-platform resolver hooks (no NFLOG / ETW provider / Endpoint Security extension required) — works uniformly on Linux, macOS, and Windows. Use when writing detection rules on suspicious hostnames / TLDs without coupling to platform-specific DNS APIs.
+Two synthesis paths, both running inside `NetworkCollector` with no per-platform resolver hooks:
+
+- **`lookup`** — emitted when a previously-unseen `(remote_host, process)` tuple appears in the current 1-hour dedupe window. Captures "what did we observe being talked to?" — the reverse direction.
+- **`query`** — emitted when a flow targets UDP/TCP port 53. The questioned hostname comes from the originating process's `cmdline_hosts` (`curl example.com`, `ssh user@host`, `dig example.com`, etc.). Captures "what did this process ask the resolver about?" — the forward direction.
+
+Cross-platform: works uniformly on Linux, macOS, and Windows. No NFLOG / ETW provider / Endpoint Security extension required. Use when writing detection rules on suspicious hostnames / TLDs without coupling to platform-specific DNS APIs.
 
 ### `files`
 
@@ -882,10 +952,15 @@ Synthesized by `NetworkCollector` when a previously-unseen `(remote_host, proces
 | `path` | absolute path |
 | `dest` | destination for renames |
 | `size`, `mode` | stat at time of event |
-| `uid`, `gid`, `user` | unix only; `user` is the resolved username for `uid` |
+| `uid`, `gid` | unix only; numeric stat of the file at event time |
+| `user` | cross-platform per-event attribution (always present where derivable). On Linux/macOS: resolved username for `uid` (the file's owning user after the change). On Windows: extracted from the path — `C:\Users\<name>\...` → `<name>`. For network/process/DNS events the value comes from the responsible PID via gopsutil and may carry the `DOMAIN\user` shape (Windows) or bare username (unix). Centralized fallback: any event with a `path` under `C:\Users\X` / `/Users/X` / `/home/X` / `/root` gets `user` set in `Storage.Write` if the source collector didn't already provide one — see `internal/sieg/user_attrib.go`. |
 | `sha384` | SHA-384 of file content on `created` / `modified` events for regular files ≤ 16 MiB. Not present on deletions / chmods / large files. Pairs with `match: { sha384: { in_file: "..." } }` for IOC feed integration. |
+| `security_critical` | `credential_store` / `sudoers_drop_in` / `windows_registry_hive` / `ssh_keystore` / `ssh_server_config` / `cron_persistence` / `systemd_unit` / `launchd_persistence` / `windows_scheduled_task` / `shell_rc` / `macos_local_users` — set on events whose path is in the security-sensitive set |
+| `severity` | `high` for credential stores + SSH keys + Windows registry hives; `medium` for persistence vectors (cron, systemd units, launchd plists, scheduled tasks, shell RC files). Operators can write rules `match: { security_critical: "credential_store" }` without enumerating paths |
 
-The `user` field is the file's owning user *after the change* — it's a proxy for the actor, not a guarantee. fsnotify can't name the actor; true exec-attribution would need fanotify or eBPF.
+The `user` field is a proxy for the actor, not a guarantee. fsnotify can't name the writing process; true per-event exec-attribution on file events would need ETW (Windows) / fanotify (Linux) / Endpoint Security (macOS, requires Apple-signed entitlement). Network / process / DNS events DO carry true PID-derived user via gopsutil; only file events fall back to the path-derived heuristic on Windows.
+
+**`/etc/passwd`-style file diff → synthesized auth events** (cross-platform on Linux + macOS): when `FileCollector` sees a `created`/`modified` event for `/etc/passwd`, `/etc/group`, `/etc/shadow`, `/etc/gshadow`, `/etc/master.passwd` (and `/private/etc/*` macOS variants), the file is read and diffed against the cached previous content. Added/removed username lines emit synthetic `auth:user_added` / `auth:user_deleted` / `auth:user_added_to_group` / `auth:user_removed_from_group` / `auth:group_added` / `auth:group_deleted` / `auth:password_changed` events with `source: "passwd_diff"` and a `detail_path` field naming the file. **Catches sub-poll-interval `useradd` AND direct edits like `vi /etc/passwd` AND image-baking changes** that no `useradd` process ever ran for. Password slot in any emitted line is redacted to `*`; `/etc/shadow` lines are hashed in memory so cleartext password hashes never enter logs.
 
 ### `auth`
 
@@ -897,11 +972,29 @@ The `user` field is the file's owning user *after the change* — it's a proxy f
 |  | `sudo` (`result`: `ok`/`failed`; includes `command`, `target` user, `terminal`, `pwd`) |
 |  | `su` |
 |  | `auth_success` / `auth_failed` / `auth_logout` / `auth_admin_assigned` (Windows; mapped from Security EventIDs 4624 / 4625 / 4634 / 4672) |
+|  | `user_added` / `user_deleted` / `user_modified` / `password_changed` |
+|  | `user_added_to_group` / `user_removed_from_group` / `group_added` / `group_deleted` / `group_modified` |
 | `user`, `terminal`, `host`, `started` | session details |
 | `remote`, `port`, `method` | for `ssh_login` |
 | `event_id`, `record_id`, `computer`, `provider`, `domain`, `logon_type`, `source_ip`, `workstation`, `failure_reason`, `windows_event_time` | Windows-only fields lifted from `wevtutil`'s RenderedXml output; useful for cross-platform rules that key on `user` and `source_ip` |
+| `actor` | for user-management events: the user that *invoked* the change (`SubjectUserName` on Windows, the calling uid on Linux/Mac). The target is `user`; the actor is `actor`. |
+| `group` | the group name for `*_to_group` / `group_*` events |
+| `source` | `process_invocation` (cmdline-driven) / `passwd_diff` (file-diff-driven) / unset (real PAM / wevtutil / log stream capture) |
+| `detail_path` | the file whose diff produced this event (`source: "passwd_diff"` only) |
 
-`ssh_*` and `sudo`/`su` events come from the Linux file tail and macOS `log stream` collectors; the four `auth_*` events come from the Windows `wevtutil.exe` poller. The same `auth` log type holds all of them, so detection rules that match on `event:auth_failed` or `user:<name>` work uniformly across platforms. When `wevtutil.exe` isn't on PATH or the service account lacks `SeSecurityPrivilege`, the daemon writes a `meta:authlog_windows_unsupported` event and the collector idles.
+**Three independent paths emit user-management events**, all into the same `auth` log type with the same shape — so detection rules that match on `event:user_added` or `user:<name>` fire uniformly regardless of which path saw it:
+
+1. **PAM / unified-log / Windows EventLog** — the original sources. Linux: `/var/log/auth.log` parser. macOS: `log stream --predicate 'process == sysadminctl OR process == dscl ...'` subprocess. Windows: `wevtutil.exe` poller for EventID 4720/4722/4724/4725/4726/4727/4730/4731/4732/4733/4734/4738/4781.
+2. **`process_invocation`** (cross-platform, `source: "process_invocation"`) — `ProcessCollector` synthesises the same shape from `process_start` cmdlines for known user/group tools:
+   - Linux: `useradd / adduser / userdel / deluser / usermod / passwd / chage / chpasswd / groupadd / groupmod / groupdel / gpasswd`
+   - macOS: `sysadminctl -addUser/-deleteUser/-resetPasswordFor`, `dscl . -create/-delete /Users/<n>`, `dseditgroup`
+   - Windows: `net user X /add`, `net localgroup G U /add`, PowerShell `New-LocalUser` / `Remove-LocalUser` / `Set-LocalUser` / `Add-LocalGroupMember` / `Remove-LocalGroupMember`
+   
+   Closes the gap on hosts without `rsyslog`/`journald` (Linux containers), without unified-log access (stripped Macs), or with audit policy disabled (Windows workstations).
+
+3. **`passwd_diff`** (Linux + macOS, `source: "passwd_diff"`) — `FileCollector` diffs `/etc/passwd`, `/etc/group`, `/etc/shadow` modifications against cached previous content and emits the appropriate event(s). Catches direct edits (`vi /etc/passwd`, `sed -i`, image-baking) that don't spawn a `useradd` at all. Password slot redacted to `*`; shadow file hashed in memory so cleartext password hashes never enter logs.
+
+`ssh_*` and `sudo`/`su` events come from the Linux file tail and macOS `log stream` collectors; the four `auth_*` events come from the Windows `wevtutil.exe` poller. When `wevtutil.exe` isn't on PATH or the service account lacks `SeSecurityPrivilege`, the daemon writes a `meta:authlog_windows_unsupported` event and the collector idles.
 
 ### `processes`
 
@@ -1040,6 +1133,9 @@ The `user` field is the file's owning user *after the change* — it's a proxy f
 | `collector_departed` | Master / server: the paired collector called `/v1/collector/depart`; the single-collector slot was freed. |
 | `master_uninstall_received` | Server: a master triggered `/v1/master/uninstall-self` and this server is starting its local teardown. |
 | `identity_conflict` | Server: a second daemon presented the same client cert from a different IP within the 60 s identity-guard window; rejected with HTTP 409. Catches "I restored a backup while the original was still running." |
+| `proc_events_listener_started` | Linux: subscribed to NETLINK_CONNECTOR PROC_EVENTS — sub-poll-interval processes are now captured in real time. Real Linux kernels with `CONFIG_PROC_EVENTS=y`. |
+| `proc_events_listener_unavailable` | Linux: kernel proc-events feed not subscribable (no `CAP_NET_ADMIN`, kernel built without `CONFIG_PROC_EVENTS` — common on Docker Desktop's LinuxKit). Carries `error` field with the underlying ECONNREFUSED / EPERM / etc. Daemon falls back to /proc polling at `process_interval`. |
+| `storage_write_failed` | Any role: the storage writer goroutine hit one or more disk-write failures (open or write errors) since the last 30 s flush. Carries `count` (failures in this interval), `cumulative_total` (lifetime), `last_error` (the most recent error string, including the offending path), `log_dir`, and a `hint` pointing at `simplesiem install --log-dir <path>`. Most common cause: `log_dir` was changed to a path the systemd unit's `ReadWritePaths` doesn't cover, or filesystem permissions deny write. The first failure also writes a multi-line banner to stderr (visible in `journalctl -u simplesiem`) so the operator sees the remediation hint immediately, not 30 s later. The previous behaviour was to silently `return` on disk-write errors, which made misconfiguration look like "the daemon is up but nothing logs." |
 
 ### `errors`
 

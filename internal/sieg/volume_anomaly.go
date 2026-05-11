@@ -192,33 +192,39 @@ func (d *volumeAnomalyDetector) start(ctx context.Context, wg *sync.WaitGroup) {
 // it without --host filtering. Best-effort: a storage error doesn't
 // re-fire the alert.
 func (s *serverState) writeAnomaly(agent string, baseline, current float64) {
-	fields := map[string]any{
-		"event":              "agent_silent_anomaly",
-		"agent":              agent,
-		"baseline_per_min":   baseline,
-		"observed_per_min":   current,
-		"drop_ratio":         current / baseline,
-		"hint":               "agent's event rate dropped below 5% of its rolling baseline for 2+ consecutive minutes — possible compromise + daemon kill, network outage, or aggressive shutdown",
+	// Sharing the same map between two writer queues races on the
+	// _seq/_prev/_hash stamping — clone per recipient.
+	build := func() map[string]any {
+		return map[string]any{
+			"event":            "agent_silent_anomaly",
+			"agent":            agent,
+			"baseline_per_min": baseline,
+			"observed_per_min": current,
+			"drop_ratio":       current / baseline,
+			"hint":             "agent's event rate dropped below 5% of its rolling baseline for 2+ consecutive minutes — possible compromise + daemon kill, network outage, or aggressive shutdown",
+		}
 	}
 	if st, err := s.storageFor(agent); err == nil {
-		st.Write("meta", fields)
+		st.Write("meta", build())
 	}
 	if st, err := s.storageFor("_server"); err == nil {
-		st.Write("meta", fields)
+		st.Write("meta", build())
 	}
 }
 
 func (s *serverState) writeRecovered(agent string, baseline, current float64) {
-	fields := map[string]any{
-		"event":            "agent_silent_recovered",
-		"agent":            agent,
-		"baseline_per_min": baseline,
-		"observed_per_min": current,
+	build := func() map[string]any {
+		return map[string]any{
+			"event":            "agent_silent_recovered",
+			"agent":            agent,
+			"baseline_per_min": baseline,
+			"observed_per_min": current,
+		}
 	}
 	if st, err := s.storageFor(agent); err == nil {
-		st.Write("meta", fields)
+		st.Write("meta", build())
 	}
 	if st, err := s.storageFor("_server"); err == nil {
-		st.Write("meta", fields)
+		st.Write("meta", build())
 	}
 }

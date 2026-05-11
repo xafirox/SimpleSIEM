@@ -142,18 +142,44 @@ func addRevocationToConfig(cfgPath, id string) (newlyRevoked bool, kind string, 
 	return true, kind, nil
 }
 
-// runCertsUnrevoke is `simplesiem certs unrevoke <id>`. Adds an
+// runCertsUnrevoke is `simplesiem certs unrevoke <subcmd|id>`. Adds an
 // "unrevoke intent" entry on this peer. When ⌈peers/2⌉+1 peers have
 // matching intents (collected via realm sync) AND the intent
 // timestamp is newer than the revocation timestamp, every peer drops
 // the tombstone on the next /v1/sync/config cycle. Single-server
 // realms quorum trivially with 1 vote.
+//
+// Subcommands:
+//
+//	unrevoke <agent-id|master-cn>     record this peer's intent
+//	unrevoke list                     show pending intents on this peer
+//	unrevoke clear <id>               withdraw this peer's intent
 func runCertsUnrevoke(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, `usage: simplesiem certs unrevoke <subcommand>
+
+subcommands:
+  <agent-id|master-cn>                  record this peer's unrevoke intent
+                                        (quorum is ⌈peers/2⌉+1 — every realm
+                                        peer must run the same command before
+                                        the tombstone is dropped)
+  list                                  show pending unrevoke intents on this peer
+  clear <agent-id|master-cn>            withdraw this peer's intent`)
+		os.Exit(2)
+	}
+	switch args[0] {
+	case "list":
+		runCertsUnrevokeList(args[1:])
+		return
+	case "clear":
+		runCertsUnrevokeClear(args[1:])
+		return
+	}
 	fs := flag.NewFlagSet("certs unrevoke", flag.ExitOnError)
 	cfgPath := fs.String("config", defaultConfigPath(), "config file")
 	_ = fs.Parse(args)
 	if fs.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage: simplesiem certs unrevoke <agent-id|master-cn>")
+		fmt.Fprintln(os.Stderr, "usage: simplesiem certs unrevoke <agent-id|master-cn>|list|clear")
 		os.Exit(2)
 	}
 	if !isAdmin() {
@@ -176,6 +202,60 @@ func runCertsUnrevoke(args []string) {
 	fmt.Println()
 	fmt.Println("Run the same command on each remaining peer (or wait for")
 	fmt.Println("operators on those hosts to vote) to reach quorum.")
+}
+
+func runCertsUnrevokeList(_ []string) {
+	cfg := loadConfig(defaultConfigPath())
+	if len(cfg.Server.AgentUnrevokeIntent) == 0 && len(cfg.Server.MasterUnrevokeIntent) == 0 {
+		fmt.Println("(no pending unrevoke intents)")
+		return
+	}
+	if len(cfg.Server.AgentUnrevokeIntent) > 0 {
+		fmt.Println("agents:")
+		for k, v := range cfg.Server.AgentUnrevokeIntent {
+			fmt.Printf("  %-30s %s\n", k, v)
+		}
+	}
+	if len(cfg.Server.MasterUnrevokeIntent) > 0 {
+		fmt.Println("masters:")
+		for k, v := range cfg.Server.MasterUnrevokeIntent {
+			fmt.Printf("  %-30s %s\n", k, v)
+		}
+	}
+}
+
+func runCertsUnrevokeClear(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: simplesiem certs unrevoke clear <agent-id|master-cn>")
+		os.Exit(2)
+	}
+	if !isAdmin() {
+		fatalf("must run as admin")
+	}
+	id := args[0]
+	cfgPath := defaultConfigPath()
+	cfg := loadConfig(cfgPath)
+	hit := false
+	if cfg.Server.AgentUnrevokeIntent != nil {
+		if _, ok := cfg.Server.AgentUnrevokeIntent[id]; ok {
+			delete(cfg.Server.AgentUnrevokeIntent, id)
+			hit = true
+		}
+	}
+	if cfg.Server.MasterUnrevokeIntent != nil {
+		if _, ok := cfg.Server.MasterUnrevokeIntent[id]; ok {
+			delete(cfg.Server.MasterUnrevokeIntent, id)
+			hit = true
+		}
+	}
+	if !hit {
+		fmt.Printf("no unrevoke intent on this peer for %q; nothing to clear\n", id)
+		return
+	}
+	if err := saveConfig(cfgPath, cfg); err != nil {
+		fatalf("save config: %v", err)
+	}
+	fmt.Printf("withdrew unrevoke intent for %q on this peer\n", id)
 }
 
 // addUnrevokeIntentToConfig records this peer's intent to drop the

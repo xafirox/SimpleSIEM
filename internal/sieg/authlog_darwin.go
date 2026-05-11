@@ -52,7 +52,15 @@ func (c *AuthLogCollector) Start(ctx context.Context, wg *sync.WaitGroup) {
 func (c *AuthLogCollector) loop(ctx context.Context) {
 	// Keep predicate narrow — `log stream` without filtering floods the
 	// pipe with thousands of events per second from kernel/system tasks.
-	predicate := `process == "sshd" OR process == "sudo" OR process == "su" OR process == "login"`
+	// User-account changes on macOS go through opendirectoryd (the
+	// Open Directory daemon that backs `dscl` / `sysadminctl` /
+	// `dseditgroup`) — adding it here is the macOS counterpart of
+	// the Linux authlog regex hits for useradd/userdel/etc., so the
+	// s2 manual-test scenario ("triage doesn't show user_added")
+	// covers Mac too.
+	predicate := `process == "sshd" OR process == "sudo" OR process == "su" OR process == "login"` +
+		` OR process == "opendirectoryd" OR process == "sysadminctl"` +
+		` OR process == "dscl" OR process == "dseditgroup"`
 
 	// Backfill the gap between the previously-seen event and now.
 	// Tracks the high-water mark so the subsequent `log stream` doesn't
@@ -271,6 +279,31 @@ var (
 	// macOS "su" emits "BAD SU <user> to <target> on <tty>" on failure;
 	// success goes via PAM and varies by version. Parse what's stable.
 	reMacSuFailed = regexp.MustCompile(`BAD SU\s+(\S+)\s+to\s+(\S+)\s+on\s+(\S+)`)
+
+	// User-account lifecycle. Open Directory's log lines are
+	// version-dependent; these regexes cover the stable phrases that
+	// have held across macOS 11–14 for the common dscl/sysadminctl
+	// invocations operators run.
+	//
+	//   sysadminctl -addUser alice -password ...
+	//   sysadminctl -deleteUser alice
+	//   dscl . -create /Users/alice
+	//   dscl . -delete /Users/alice
+	//   dseditgroup -o edit -a alice -t user admin
+	//
+	// We anchor on the recognisable verb + path / username pair
+	// rather than trying to parse every diagnostic field.
+	reMacSysadminAdd      = regexp.MustCompile(`(?i)\b(?:addUser|created\s+user)\s+(\S+)`)
+	reMacSysadminDel      = regexp.MustCompile(`(?i)\b(?:deleteUser|deleted\s+user)\s+(\S+)`)
+	reMacDsclUserCreate   = regexp.MustCompile(`(?i)\bcreate\s+/Users/(\S+)`)
+	reMacDsclUserDelete   = regexp.MustCompile(`(?i)\bdelete\s+/Users/(\S+)`)
+	reMacDsclGroupCreate  = regexp.MustCompile(`(?i)\bcreate\s+/Groups/(\S+)`)
+	reMacDsclGroupDelete  = regexp.MustCompile(`(?i)\bdelete\s+/Groups/(\S+)`)
+	reMacDseditGroupAdd   = regexp.MustCompile(`(?i)\b-a\s+(\S+).*?-t\s+user\s+(\S+)`)
+	reMacDseditGroupDel   = regexp.MustCompile(`(?i)\b-d\s+(\S+).*?-t\s+user\s+(\S+)`)
+	reMacOpenDirCreate    = regexp.MustCompile(`(?i)\bRecord\s+created.*?/Users/(\S+)`)
+	reMacOpenDirDelete    = regexp.MustCompile(`(?i)\bRecord\s+deleted.*?/Users/(\S+)`)
+	reMacPasswordChanged  = regexp.MustCompile(`(?i)\bpassword.*?(?:changed|reset).*?for\s+(?:user\s+)?(\S+)`)
 )
 
 // parseDarwinAuthLine matches a single ndjson entry. Returns nil for entries
@@ -316,6 +349,47 @@ func parseDarwinAuthLine(line []byte) map[string]any {
 				"event": "su", "user": m[1], "target": m[2],
 				"terminal": m[3], "result": "failed",
 			}
+		}
+	case "sysadminctl":
+		if m := reMacSysadminAdd.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_added", "user": m[1]}
+		}
+		if m := reMacSysadminDel.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_deleted", "user": m[1]}
+		}
+		if m := reMacPasswordChanged.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "password_changed", "user": m[1]}
+		}
+	case "dscl":
+		if m := reMacDsclUserCreate.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_added", "user": m[1]}
+		}
+		if m := reMacDsclUserDelete.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_deleted", "user": m[1]}
+		}
+		if m := reMacDsclGroupCreate.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "group_added", "group": m[1]}
+		}
+		if m := reMacDsclGroupDelete.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "group_deleted", "group": m[1]}
+		}
+	case "dseditgroup":
+		if m := reMacDseditGroupAdd.FindStringSubmatch(msg); m != nil {
+			return map[string]any{
+				"event": "user_added_to_group", "user": m[1], "group": m[2],
+			}
+		}
+		if m := reMacDseditGroupDel.FindStringSubmatch(msg); m != nil {
+			return map[string]any{
+				"event": "user_removed_from_group", "user": m[1], "group": m[2],
+			}
+		}
+	case "opendirectoryd":
+		if m := reMacOpenDirCreate.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_added", "user": m[1]}
+		}
+		if m := reMacOpenDirDelete.FindStringSubmatch(msg); m != nil {
+			return map[string]any{"event": "user_deleted", "user": m[1]}
 		}
 	}
 	return nil

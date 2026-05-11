@@ -66,7 +66,7 @@ sudo simplesiem alerts --since 1h
 
 ### Periodic re-authentication
 
-Each agent runs a heartbeat goroutine that calls `GET /v1/heartbeat` every `server.agent_reauth_seconds` (default 60s). The response carries the current interval, so changing it on the server propagates to every agent on the next beat — no agent restart needed. A heartbeat that fails surfaces in the agent's local errors log within the interval, which is also the worst-case revocation latency: removing an ID from `agent_allowlist` rejects the next heartbeat.
+Each agent runs a heartbeat goroutine that calls `GET /v1/heartbeat` every `server.agent_reauth_seconds` (default 15s). The response carries the current interval, so changing it on the server propagates to every agent on the next beat — no agent restart needed. A heartbeat that fails surfaces in the agent's local errors log within the interval, which is also the worst-case revocation latency: removing an ID from `agent_allowlist` rejects the next heartbeat.
 
 ## Storage layout
 
@@ -182,9 +182,18 @@ sudo simplesiem certs revoke laptop-old
 sudo simplesiem certs revoked       # list current tombstones
 ```
 
-The merge is **additive** — removing a tombstone on one peer doesn't propagate the removal. To "unrevoke", an operator must edit each peer's `config.json` directly. (A future feature may add quorum-based deletion.)
+The merge is **additive** — removing a tombstone on one peer doesn't propagate the removal. To undo a revocation, every realm peer records an "unrevoke intent" via `simplesiem certs unrevoke`. Quorum is ⌈peers/2⌉+1; once that many peers have matching intents AND the latest intent timestamp is newer than the original revocation timestamp, every peer drops the tombstone on the next `/v1/sync/config` cycle. Single-server realms quorum trivially with 1 vote.
 
-For master CNs, the same command works: `simplesiem certs revoke master-ops-01`.
+```
+# On every peer in the realm:
+sudo simplesiem certs unrevoke laptop-old
+
+# Inspect / withdraw on this peer:
+sudo simplesiem certs unrevoke list
+sudo simplesiem certs unrevoke clear laptop-old
+```
+
+For master CNs, the same commands work: `simplesiem certs revoke master-ops-01` and `simplesiem certs unrevoke master-ops-01`.
 
 ## Convert mode
 
@@ -206,6 +215,23 @@ sudo simplesiem convert standalone
 | `--key <PSK>` | (agent only) Run PSK enrollment as part of convert |
 | `--force` | (agent only) Skip the connectivity preflight |
 | `--listen <addr>` | (server only) Pre-populate `server.listen` (default `:9443`) |
+
+**Atomicity guarantees:** convert refuses to leave the install in a half-state. Operator-visible behaviour:
+
+- All flag values whose shape we can verify offline (`--server`, `--realm` URL parsing, scheme + host check) are validated **before any state mutation**. A typo in a URL surfaces as `--realm URL is malformed (config NOT changed): ...` and exits with config untouched.
+- For `--mode server` targets, the server PKI bootstrap (CA + server cert + enrollment PSK) runs **before** `config.json` is rewritten. If PKI generation fails (orphaned `ca.pem` from a prior agent role with no matching `ca.key`, filesystem permissions on the certs dir, etc.), the convert exits with the original config in place. Re-running after the cert state is fixed picks up cleanly. (Earlier behaviour: PKI ran AFTER `saveConfig`, so a failure left `mode=server` on disk with agent-shaped certs and the daemon refused to start.)
+- Partial CA state on disk (one of `ca.pem` / `ca.key` present without the other) is detected by both `certs init` and `convert ... server`; the orphan is moved aside to `<file>.orphaned.<UTC>` (preserved for audit) and a fresh CA is generated.
+
+**Departure notifications fire on every convert path** so the realm and any upstream coordinators are never left with stale entries:
+
+| From → To | Notification | Endpoint hit |
+|---|---|---|
+| agent → server / standalone / master / collector | `notifyAgentDeparture` | `POST /v1/agent/depart` on `agent.server_url` (drops the agent_id from `server.agent_allowlist`) |
+| server → agent / standalone / master / collector | `notifyServerDeparture` | `POST /v1/realm/leave` on each `server.realm.peers[]` (drops this server from the peer's `realm.peers`; trust bundle rebuilt on next sync) |
+| master → * | `notifyMasterDeparture` | `POST /v1/master/depart` on each enrolled `master.servers[]` |
+| collector → * | `notifyCollectorDeparture` | `POST /v1/collector/depart` on the paired source (frees the single collector slot) |
+
+Notifications are best-effort — a peer that doesn't answer at convert time eventually notices the daemon going dark and prunes via the existing realm-sync TTL — but the explicit signal removes the lag and prevents stale `agent_allowlist` / `realm.peers` entries that block re-enrollment under the same identity.
 
 **Agent connectivity preflight:** when the target is `agent`, convert refuses to mutate `config.json` unless it can prove the server is actually ready to accept this agent. The preflight checks, in order:
 
@@ -242,7 +268,7 @@ Common server-mode keys (full list in [reference.md#server-mode-keys](reference.
 | `server.max_concurrent` | simultaneous in-flight uploads; over this returns 503 |
 | `server.rate_per_second` / `rate_burst` | per-IP token bucket |
 | `server.max_clock_skew_seconds` | accept agent timestamps within ±this many seconds |
-| `server.agent_reauth_seconds` | heartbeat interval (default 60s) |
+| `server.agent_reauth_seconds` | heartbeat interval (default 15s) |
 
 ## Agent config keys
 

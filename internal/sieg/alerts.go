@@ -694,6 +694,26 @@ func loadRules(path string) ([]*alertRule, error) {
 	if err != nil {
 		return nil, err
 	}
+	out, err := parseRulesData(data)
+	if err != nil {
+		return nil, err
+	}
+	// MITRE Phase 2 — merge the auto-generated sidecar so its rules
+	// are evaluated alongside the operator's rules.json without
+	// requiring the operator to copy them in by hand. Done here (the
+	// path-aware loader) rather than in parseRulesData so the
+	// validation-only path (parseRulesBytes) doesn't pull in a
+	// sidecar the caller never asked for.
+	return mergeMitreGeneratedRules(out, path), nil
+}
+
+// parseRulesData is the loader's pure-bytes entry point. Used by
+// parseRulesBytes (validation path) so callers don't have to round-
+// trip through a temp file just to invoke the same parsing logic.
+// Writing temp files into /tmp on every validation lit up the file
+// watcher with ~13 created+deleted events per startup (one per MITRE
+// auto-generated rule).
+func parseRulesData(data []byte) ([]*alertRule, error) {
 	var raw []struct {
 		Name        string         `json:"name"`
 		Severity    string         `json:"severity"`
@@ -716,12 +736,20 @@ func loadRules(path string) ([]*alertRule, error) {
 			Within  string           `json:"within"`
 			GroupBy string           `json:"group_by"`
 		} `json:"sequence"`
+		// Disabled keeps a rule in the file but stops it from
+		// firing. Operators flip this with `simplesiem rules
+		// disable <name>`; the loader silently skips disabled
+		// entries so they don't pollute counts or coverage.
+		Disabled bool `json:"disabled"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse rules: %w", err)
 	}
 	out := make([]*alertRule, 0, len(raw))
 	for i, r := range raw {
+		if r.Disabled {
+			continue
+		}
 		if r.Name == "" {
 			return nil, fmt.Errorf("rule %d: name is required", i)
 		}
@@ -819,12 +847,6 @@ func loadRules(path string) ([]*alertRule, error) {
 		}
 		out = append(out, rule)
 	}
-	// MITRE Phase 2 — merge the auto-generated sidecar so its rules
-	// are evaluated alongside the operator's rules.json without
-	// requiring the operator to copy them in by hand. Best-effort:
-	// a malformed sidecar is silently skipped (logged via meta when
-	// the manager next runs).
-	out = mergeMitreGeneratedRules(out, path)
 	return out, nil
 }
 

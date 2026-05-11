@@ -82,3 +82,112 @@ func TestParseWindowsAuthEvent_MalformedXML(t *testing.T) {
 		t.Error("parseWindowsAuthEvent: ok=true on truncated XML, want false")
 	}
 }
+
+// TestParseWindowsAuthEvent_UserAdded verifies a 4720 (user account
+// created) event is mapped to the canonical "user_added" event name
+// shared with the Linux/macOS parsers, with the target on `user`
+// and the admin on `actor`. This is the cross-platform leg of the s2
+// fix — without it, Mac+Win triage would still miss user creation.
+func TestParseWindowsAuthEvent_UserAdded(t *testing.T) {
+	const sample = `<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4720</EventID><EventRecordID>5001</EventRecordID><TimeCreated SystemTime="2026-05-07T12:00:00.000Z"/><Computer>WIN-LAB-01</Computer></System><EventData><Data Name="TargetUserName">attacker</Data><Data Name="TargetDomainName">WIN-LAB-01</Data><Data Name="SubjectUserName">administrator</Data></EventData></Event>`
+	ev, _, ok := parseWindowsAuthEvent(sample)
+	if !ok {
+		t.Fatal("parseWindowsAuthEvent: ok=false on valid 4720")
+	}
+	if ev["event"] != "user_added" {
+		t.Errorf("event: got %v, want user_added", ev["event"])
+	}
+	if ev["user"] != "attacker" {
+		t.Errorf("user: got %v, want attacker", ev["user"])
+	}
+	if ev["actor"] != "administrator" {
+		t.Errorf("actor: got %v, want administrator", ev["actor"])
+	}
+}
+
+// TestParseWindowsAuthEvent_GroupMembership verifies 4732 (member added
+// to local group) maps target onto `group` and member onto `user` so
+// triage's user_added_to_group case renders consistently with Linux.
+func TestParseWindowsAuthEvent_GroupMembership(t *testing.T) {
+	const sample = `<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4732</EventID><EventRecordID>5002</EventRecordID><TimeCreated SystemTime="2026-05-07T12:00:00.000Z"/><Computer>WIN-LAB-01</Computer></System><EventData><Data Name="MemberName">CN=alice</Data><Data Name="TargetUserName">Administrators</Data><Data Name="SubjectUserName">administrator</Data></EventData></Event>`
+	ev, _, ok := parseWindowsAuthEvent(sample)
+	if !ok {
+		t.Fatal("parseWindowsAuthEvent: ok=false on valid 4732")
+	}
+	if ev["event"] != "user_added_to_group" {
+		t.Errorf("event: got %v, want user_added_to_group", ev["event"])
+	}
+	if ev["group"] != "Administrators" {
+		t.Errorf("group: got %v, want Administrators", ev["group"])
+	}
+	if ev["user"] != "CN=alice" {
+		t.Errorf("user: got %v, want CN=alice", ev["user"])
+	}
+}
+
+// TestSplitWevtutilEvents_MultilineUserAccountControl verifies the
+// splitter recovers a complete 4720 Event whose UserAccountControl
+// data field carries embedded newlines. The previous per-line
+// `strings.Split` would have fragmented this Event across lines and
+// xml.Unmarshal would have failed on each fragment — the bug that
+// caused Add-LocalUser → 4720 events to never reach `simplesiem
+// query` despite firing in the Security log.
+func TestSplitWevtutilEvents_MultilineUserAccountControl(t *testing.T) {
+	const raw = `<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Security-Auditing'/><EventID>4720</EventID><EventRecordID>26107</EventRecordID><TimeCreated SystemTime='2026-05-09T02:30:42Z'/><Computer>WindowsTest</Computer></System><EventData><Data Name='TargetUserName'>uatuser1</Data><Data Name='SubjectUserName'>Administrator</Data><Data Name='UserAccountControl'>
+		%%2080
+		%%2082
+		%%2084</Data></EventData></Event>`
+	blobs := splitWevtutilEvents(raw)
+	if len(blobs) != 1 {
+		t.Fatalf("expected 1 event blob, got %d", len(blobs))
+	}
+	ev, recID, ok := parseWindowsAuthEvent(blobs[0])
+	if !ok {
+		t.Fatalf("parseWindowsAuthEvent returned ok=false on a multi-line 4720 blob — the splitter handed back fragments")
+	}
+	if recID != 26107 {
+		t.Errorf("recID: got %d, want 26107", recID)
+	}
+	if ev["event"] != "user_added" {
+		t.Errorf("event: got %v, want user_added", ev["event"])
+	}
+	if ev["user"] != "uatuser1" {
+		t.Errorf("user: got %v, want uatuser1", ev["user"])
+	}
+}
+
+// TestSplitWevtutilEvents_MultipleEvents verifies the splitter pulls
+// out two consecutive Events from a single wevtutil batch.
+func TestSplitWevtutilEvents_MultipleEvents(t *testing.T) {
+	const raw = `<Event><System><EventID>4624</EventID><EventRecordID>1</EventRecordID></System><EventData><Data Name='TargetUserName'>alice</Data></EventData></Event>
+<Event><System><EventID>4720</EventID><EventRecordID>2</EventRecordID></System><EventData><Data Name='TargetUserName'>bob</Data><Data Name='UserAccountControl'>
+		%%2080
+		%%2082</Data></EventData></Event>`
+	blobs := splitWevtutilEvents(raw)
+	if len(blobs) != 2 {
+		t.Fatalf("expected 2 event blobs, got %d", len(blobs))
+	}
+	ev1, _, ok := parseWindowsAuthEvent(blobs[0])
+	if !ok || ev1["event"] != "auth_success" {
+		t.Errorf("blob[0]: parsed=%v event=%v", ok, ev1["event"])
+	}
+	ev2, _, ok := parseWindowsAuthEvent(blobs[1])
+	if !ok || ev2["event"] != "user_added" {
+		t.Errorf("blob[1]: parsed=%v event=%v", ok, ev2["event"])
+	}
+}
+
+// TestParseWindowsAuthEvent_UserDeleted verifies 4726 → user_deleted.
+func TestParseWindowsAuthEvent_UserDeleted(t *testing.T) {
+	const sample = `<Event><System><Provider Name="Microsoft-Windows-Security-Auditing"/><EventID>4726</EventID><EventRecordID>5003</EventRecordID><Computer>WIN-LAB-01</Computer></System><EventData><Data Name="TargetUserName">attacker</Data><Data Name="SubjectUserName">administrator</Data></EventData></Event>`
+	ev, _, ok := parseWindowsAuthEvent(sample)
+	if !ok {
+		t.Fatal("parseWindowsAuthEvent: ok=false on valid 4726")
+	}
+	if ev["event"] != "user_deleted" {
+		t.Errorf("event: got %v, want user_deleted", ev["event"])
+	}
+	if ev["user"] != "attacker" {
+		t.Errorf("user: got %v, want attacker", ev["user"])
+	}
+}

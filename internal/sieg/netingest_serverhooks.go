@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 )
 
@@ -165,11 +164,3 @@ func (s *serverState) metaLogger() *Storage {
 	return nil
 }
 
-// recordMasterURLHint persists the URL the master enrolled with so
-// future server-originated edits can find their master. Best-effort —
-// failure to write is silent.
-func recordMasterURLHint(url string) {
-	dir := defaultStateDir()
-	_ = os.MkdirAll(dir, 0o700)
-	_ = os.WriteFile(masterURLHintPath(), []byte(url), 0o600)
-}

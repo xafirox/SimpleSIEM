@@ -91,7 +91,7 @@ When the master enrolls with one server in a realm, the master automatically lea
 
 - The just-enrolled master calls `GET /v1/sync/config` on its primary (the server it ran `master enroll` against). The response carries `peers`, `peer_cas`, and `master_cns`.
 - For every peer URL the master doesn't yet have a cert dir for, it copies its A-signed cert + key into `<config>/master/<peer>/` and writes the peer's CA from `peer_cas` as `ca.pem`. The cert is valid against every realm peer because the realm's trust bundle on each peer includes every peer's CA (built by `realm join`).
-- The just-enrolled server's `master_cns` already contains the new master. On the next `/v1/sync/config` cycle (≤ `realm.sync_interval_seconds`, default 60s), realm peers merge that CN into their own `master_cns` — so subsequent pulls from those peers succeed.
+- The just-enrolled server's `master_cns` already contains the new master. On the next `/v1/sync/config` cycle (≤ `realm.sync_interval_seconds`, default 15s), realm peers merge that CN into their own `master_cns` — so subsequent pulls from those peers succeed.
 - Until that cycle completes, pulls from auto-discovered peers may fail with HTTP 403. The master pull goroutine retries on the next cycle and starts succeeding once propagation is done. This is silent — no operator action.
 
 **When auto-discovery is skipped** for a particular peer:

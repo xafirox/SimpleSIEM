@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 )
 
 // runLogDirMigrate is the CLI entry for `simplesiem log-dir migrate
@@ -52,9 +54,32 @@ func runLogDirMigrate(args []string) {
 		fatalf("refusing: a collector is paired with this host. Changing log_dir would put the collector's per-host mirror layout out of sync. Revoke the collector pairing first (`master collector revoke` / `certs collector revoke`).")
 	}
 
-	// Daemon-must-be-stopped guard.
-	if isRunning() {
-		fatalf("refusing: SimpleSIEM daemon is running; stop it first (`simplesiem stop`) so log files can be moved without open-file conflicts.")
+	// Daemon-orchestrated lifecycle: open files block the rename, but
+	// asking the operator to stop+start the daemon by hand is a poor
+	// UX. If the daemon is up we stop it ourselves, perform the
+	// migration, then start it again — so a single command does the
+	// whole flow. We only do this when the operator hasn't passed
+	// `-y`-equivalent guard rails would let them keep manual control.
+	wasRunning := isRunning()
+	if wasRunning {
+		fmt.Println("daemon is running; stopping it for the migration...")
+		// stopCommand's flagset doesn't define -y (it has no
+		// confirmation prompt to skip), and flag.ExitOnError aborts
+		// the whole process if we pass an unknown flag. Hand it nil
+		// args so the platform branch (systemctl / launchctl / SCM)
+		// runs cleanly.
+		stopCommand(nil)
+		// Give file handles time to close before we try to rename
+		// the log_dir from underneath them.
+		for i := 0; i < 30; i++ {
+			if !isRunning() {
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		if isRunning() {
+			fatalf("daemon did not stop after `simplesiem stop`; aborting migration. Stop the daemon manually and retry.")
+		}
 	}
 
 	// Source-existence guard. A non-existent source is harmless —
@@ -114,7 +139,7 @@ func runLogDirMigrate(args []string) {
 			fatalf("update config.json: %v (rolled back)", err)
 		}
 		fmt.Printf("migration complete: log_dir moved %s -> %s\n", oldDir, newDir)
-		fmt.Println("config.json updated; start the daemon with: sudo simplesiem start")
+		finishMigrationLifecycle(*cfgPath, oldDir, newDir, wasRunning)
 		return
 	}
 
@@ -141,7 +166,104 @@ func runLogDirMigrate(args []string) {
 		fatalf("config update failed AFTER cross-fs copy: %v\nManually edit %s and set log_dir to %s, OR move %s back to %s", err, *cfgPath, newDir, newDir, oldDir)
 	}
 	fmt.Printf("migration complete: log_dir moved %s -> %s (%d files copied)\n", oldDir, newDir, moved)
-	fmt.Println("config.json updated; start the daemon with: sudo simplesiem start")
+	finishMigrationLifecycle(*cfgPath, oldDir, newDir, wasRunning)
+}
+
+// finishMigrationLifecycle handles the post-migration daemon dance for
+// BOTH the rename and the cross-fs branches: auto-restart the daemon
+// when it was running before, then verify the new log_dir is actually
+// being written into. The cross-fs branch previously skipped restart,
+// which is the bug the user hit at s5 — they migrated across drives,
+// the daemon stayed stopped, and "no logs in new dir" was the visible
+// symptom.
+//
+// Verification reads config back from disk to confirm the on-disk
+// LogDir matches what we wrote, then waits up to 30s for the daemon
+// to drop a fresh meta file under newDir/. A failure surfaces as a
+// loud stderr warning; the migration itself stays successful (data is
+// already in newDir and config.json is updated — the operator can
+// debug the start failure separately).
+func finishMigrationLifecycle(cfgPath, oldDir, newDir string, wasRunning bool) {
+	// Confirm the config write actually landed. saveConfig errors are
+	// already handled upstream, but reading back catches the rarer
+	// "wrote successfully but the file's wrong" case (filesystem cache
+	// weirdness, permission flip).
+	if got, err := loadConfigStrict(cfgPath); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: re-reading %s after migration failed: %v\n", cfgPath, err)
+		fmt.Fprintln(os.Stderr, "the migration moved files but the on-disk config may be stale — restart the daemon manually after verifying the file.")
+		return
+	} else if got.LogDir != newDir {
+		fmt.Fprintf(os.Stderr, "warning: %s now reports log_dir=%s, expected %s\n", cfgPath, got.LogDir, newDir)
+		return
+	}
+
+	if !wasRunning {
+		fmt.Println("config.json updated; start the daemon with: sudo simplesiem start")
+		return
+	}
+
+	fmt.Println("restarting daemon at the new log_dir...")
+	startCommand([]string{})
+	// Verify the daemon actually came up and is writing to newDir.
+	// The first writes at startup (start meta event, rules_loaded,
+	// etc.) land within ~2 seconds in practice; we give a generous
+	// 30s budget and surface progress so an operator can tell the
+	// difference between "still booting" and "didn't restart".
+	deadline := time.Now().Add(30 * time.Second)
+	verified := false
+	for time.Now().Before(deadline) {
+		if migrationFreshActivity(newDir, time.Now().Add(-30*time.Second)) {
+			verified = true
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if !verified {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "warning: daemon did not write to the new log_dir within 30s.")
+		fmt.Fprintf(os.Stderr, "         data was successfully moved to %s and config.json was\n", newDir)
+		fmt.Fprintf(os.Stderr, "         updated, but the daemon either failed to restart or is\n")
+		fmt.Fprintf(os.Stderr, "         silent. Check: simplesiem status\n")
+		fmt.Fprintln(os.Stderr, "         If status shows 'not running', read the service log and rerun")
+		fmt.Fprintln(os.Stderr, "         simplesiem start; the migration itself is intact.")
+		return
+	}
+	fmt.Printf("verified: daemon is writing to %s\n", newDir)
+}
+
+// migrationFreshActivity reports whether ANY .jsonl file under base has
+// been modified after `since`. Used by the post-migration verifier to
+// confirm the daemon is alive at the new log_dir without relying on
+// any specific log type (the first write could be meta:start, a rule
+// load, the writer watchdog heartbeat, etc.).
+func migrationFreshActivity(base string, since time.Time) bool {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return false
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		typeDir := filepath.Join(base, e.Name())
+		files, err := os.ReadDir(typeDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			if !strings.HasSuffix(f.Name(), ".jsonl") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(since) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // copyTree recursively copies src to dst, returning the number of

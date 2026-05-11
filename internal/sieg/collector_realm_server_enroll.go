@@ -131,7 +131,7 @@ func (c *collectorListenerState) handleEnrollRealmServer(w http.ResponseWriter, 
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: er.MasterID, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(c.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},

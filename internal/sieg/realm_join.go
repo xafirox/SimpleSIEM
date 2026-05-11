@@ -389,11 +389,20 @@ If <peer-url> is omitted, you'll be prompted for it too.`)
 // <state>/realm/peer_cas/, merges the peer list + realm name into
 // our config.json, and prints a restart hint.
 func runRealmJoin(args []string) {
-	args = permuteArgs(args, map[string]bool{"config": true, "key": true, "yes": true})
+	args = permuteArgs(args, map[string]bool{"config": true, "key": true, "yes": true, "no-restart": true})
 	fs := flag.NewFlagSet("realm join", flag.ExitOnError)
 	cfgPath := fs.String("config", defaultConfigPath(), "config file")
 	psk := fs.String("key", "", "enrollment PSK from the target peer")
 	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	// no-restart is an in-daemon-only flag: the pendingJoinWatcher
+	// completes a master-driven migration from inside the running
+	// daemon. The CLI path's auto-restart would call stopCommand on
+	// the very service running pendingJoinWatcher — on Windows that
+	// kills the daemon before startCommand can fire, leaving the host
+	// with the simplesiem service in Stopped state. The trust bundle
+	// is loaded per-handshake via GetConfigForClient, so a restart
+	// isn't required for the new realm CA to take effect.
+	noRestart := fs.Bool("no-restart", false, "skip the post-join daemon restart (used by in-daemon callers)")
 	_ = fs.Parse(args)
 
 	if !isAdmin() {
@@ -595,7 +604,13 @@ func runRealmJoin(args []string) {
 	// Auto-restart so the new trust bundle is in effect immediately.
 	// Without this, agent failover and peer-sync handshakes keep
 	// rejecting peer certs until the operator manually restarts.
-	if isRunning() {
+	// pendingJoinWatcher passes --no-restart because it runs INSIDE
+	// the daemon — calling stopCommand on Windows would kill the very
+	// process that's running this code. The trust bundle is loaded
+	// per-handshake via GetConfigForClient (see tls.go), so the new
+	// CA pool is picked up on the next inbound connection without a
+	// daemon restart.
+	if !*noRestart && isRunning() {
 		restartCommand(nil)
 	}
 	fmt.Println()

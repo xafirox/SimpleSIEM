@@ -15,18 +15,7 @@ import (
 // don't require root or a running daemon.
 func runRulesCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, `usage: simplesiem rules <check|test|replay|stats|coverage> [flags]
-
-  check          parse and compile rules.json; exit nonzero on error
-  test <file>    replay JSONL events through current rules and report fires
-                 (use - for stdin)
-  replay         replay current rules over historical events from log_dir
-                 (--since, --type, --host, --rules)
-  stats          aggregate alert fire counts per rule from on-disk alerts
-                 (--since, --host)
-  coverage       group rules by MITRE ATT&CK tactic / technique and
-                 show fire counts. Identifies coverage gaps and
-                 chronically-firing rules per technique.`)
+		rulesUsage()
 		os.Exit(2)
 	}
 	switch args[0] {
@@ -50,10 +39,116 @@ func runRulesCmd(args []string) {
 		runRulesTestCmd(args[1:])
 	case "suggest-suppression":
 		runRulesSuggestSuppression(args[1:])
+	case "list":
+		runRulesList(args[1:])
+	case "show":
+		runRulesShow(args[1:])
+	case "add":
+		runRulesAdd(args[1:])
+	case "delete", "remove":
+		runRulesDelete(args[1:])
+	case "enable":
+		runRulesEnableValidated(args[1:])
+	case "disable":
+		runRulesEnableDisable(args[1:], false)
+	case "new":
+		runRulesNew(args[1:])
+	case "set":
+		runRulesSet(args[1:])
+	case "unset":
+		runRulesUnset(args[1:])
+	case "match":
+		runRulesMatch(args[1:])
+	case "unmatch":
+		runRulesUnmatch(args[1:])
+	case "threshold":
+		runRulesThreshold(args[1:])
+	case "unthreshold":
+		runRulesUnthreshold(args[1:])
+	case "sequence-step":
+		runRulesSequenceStep(args[1:])
+	case "sequence-clear":
+		runRulesSequenceClear(args[1:])
+	case "sequence-set":
+		runRulesSequenceSet(args[1:])
+	case "validate":
+		runRulesValidate(args[1:])
+	case "help", "-h", "--help":
+		rulesUsage()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown rules subcommand: %s\n", args[0])
+		rulesUsage()
 		os.Exit(2)
 	}
+}
+
+func rulesUsage() {
+	fmt.Fprintln(os.Stderr, `usage: simplesiem rules <subcommand> [flags]
+
+build a rule (stepwise — never type JSON; new rules start disabled):
+  new <id>                               create a draft rule (disabled until enable)
+  set <id> severity <low|medium|high|critical>
+  set <id> dedup-window <duration>       e.g. 5m, 30s
+  set <id> dedup-key <field>             group dedup by this event field
+  set <id> notes "<text>"                one-line description for alerts
+  set <id> runbook-url <url>             triage link surfaced on alerts
+  set <id> tactic <ID>                   MITRE ATT&CK tactic (e.g. TA0006)
+  set <id> technique <ID>                MITRE ATT&CK technique (e.g. T1110.001)
+  set <id> time-of-day <HH:MM-HH:MM>     daemon local-time gate
+  set <id> weekdays <mon,tue,...>        comma-separated weekday gate
+  unset <id> <field>                     remove a top-level field
+
+  match <id> <key> <value>               equality match (default)
+  match <id> <key> --regex <pattern>     regex match
+  match <id> <key> --substr <s>          substring match
+  match <id> <key> --cidr <range>        CIDR match (also --not-cidr)
+  match <id> <key> --in-file <path>      file-list match (also --not-in-file)
+  match <id> <key> --gt <num>            numeric > (also --lt, --ge, --le)
+  match <id> <key> --any v1,v2,v3        any-of (comma-separated)
+  unmatch <id> <key>                     remove a match key
+
+  threshold <id> <count> <window> [<group_by>]      add/replace threshold block
+  unthreshold <id>                                  drop the threshold block
+
+  sequence-step <id> <key>=<value> [<key>=<value>...]   append a sequence step
+  sequence-clear <id>                                   drop every sequence step
+  sequence-set <id> within <duration>                   sequence window
+  sequence-set <id> group-by <field>                    sequence grouping field
+
+activate / deactivate / inspect:
+  validate <id>                          dry-run validation (required fields, schema, parse)
+  enable <id>                            validate then activate (refuses on error)
+  disable <id>                           keep in file but stop firing
+  delete <id>                            remove from rules.json
+  list                                   one line per rule (id, severity, match-key count, state)
+  show <id>                              print the full rule JSON
+
+read-only / triage:
+  check                                  parse + compile rules.json; nonzero exit on error
+  test <file|->                          replay JSONL events through rules + report fires
+  replay [--since 7d] [--type T] ...     replay over historical events on disk
+  stats [--since 24h] [--host H]         aggregate fire counts from the alerts log
+  coverage [--since 7d]                  group rules by MITRE ATT&CK + per-group fires
+  backtest --rule <file> [--against 30d] dry-run a draft rule against history
+  tune [--apply]                         classify dead / runaway / mis-severity rules
+  fixture-test                           replay auto-captured fixtures against current rules
+  suggest-suppression [--since 30d]      surface ack patterns ready to become suppressions
+
+power-user:
+  add <file|->                           append every rule object in <file> (- for stdin) — JSON
+  suppress <list|add|remove>             scoped, time-bounded suppressions sidecar
+
+example session:
+  sudo simplesiem rules new ssh-brute
+  sudo simplesiem rules set ssh-brute severity high
+  sudo simplesiem rules match ssh-brute type auth
+  sudo simplesiem rules match ssh-brute event ssh_login
+  sudo simplesiem rules match ssh-brute result --any failed,invalid_user
+  sudo simplesiem rules threshold ssh-brute 5 60s remote
+  sudo simplesiem rules set ssh-brute dedup-window 5m
+  sudo simplesiem rules set ssh-brute tactic TA0006
+  sudo simplesiem rules set ssh-brute technique T1110.001
+  sudo simplesiem rules enable ssh-brute`)
 }
 
 // runRulesCoverage groups rules by MITRE tactic + technique and

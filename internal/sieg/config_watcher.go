@@ -59,10 +59,36 @@ func (w *configWatcher) run(ctx context.Context) {
 }
 
 // applyOnce loads the current config from disk and diffs it against
-// the in-memory state. Best-effort — a parse failure logs to errors
-// and leaves the in-memory state untouched.
+// the in-memory state. On JSON parse failure we EXPLICITLY refuse to
+// touch the in-memory state — `loadConfig` would silently fall back
+// to defaults, which would wipe the allowlist, master_cns and revocation
+// maps the daemon currently honours. Surfacing this as a meta event
+// gives the operator visible feedback (`simplesiem status` notes recent
+// _server errors) instead of the previous silent "your edit broke
+// something and the daemon kept running with defaults" failure mode.
 func (w *configWatcher) applyOnce() {
-	cfg := loadConfig(w.cfgPath)
+	cfg, perr := loadConfigStrict(w.cfgPath)
+	if perr != nil {
+		// Parse failed. Don't apply anything. Emit a meta event so the
+		// operator can spot the bad edit via `simplesiem status` —
+		// without it the daemon keeps running on the last-good config
+		// indefinitely with no on-disk indication that hot-reload is
+		// dead.
+		if mst, err := w.state.storageFor("_server"); err == nil {
+			mst.Write("errors", map[string]any{
+				"collector": "config_watcher",
+				"error":     "config.json parse failed; in-memory config unchanged",
+				"detail":    perr.Error(),
+				"hint":      "fix the JSON syntax (see error detail) or restore the previous version with: cp " + w.cfgPath + ".bak " + w.cfgPath,
+			})
+			mst.Write("meta", map[string]any{
+				"event":  "config_invalid",
+				"path":   w.cfgPath,
+				"detail": perr.Error(),
+			})
+		}
+		return
+	}
 	s := w.state
 
 	// m9 — log_dir change refused when a collector is paired (or

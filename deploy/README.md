@@ -1,4 +1,4 @@
-# Deployment recipes - NOT TESTED
+# Deployment recipes
 
 Three reference deployments, each in its own directory:
 

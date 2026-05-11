@@ -601,11 +601,18 @@ func (s *Shipper) pruneSpool() error {
 		if e.IsDir() {
 			continue
 		}
-		info, err := e.Info()
+		// `os.Stat(path)` rather than `e.Info()` — Windows
+		// directory-cached size is stale for spool files the
+		// shipper still has open in O_APPEND mode (the live
+		// "should-I-trim-the-spool" decision needs the actual
+		// on-disk size, not the MFT entry which only refreshes
+		// when the file is closed).
+		path := filepath.Join(s.spoolDir, e.Name())
+		info, err := os.Stat(path)
 		if err != nil {
 			continue
 		}
-		items = append(items, item{path: filepath.Join(s.spoolDir, e.Name()), size: info.Size(), name: e.Name()})
+		items = append(items, item{path: path, size: info.Size(), name: e.Name()})
 		total += info.Size()
 	}
 	if total <= s.spoolMaxByte {

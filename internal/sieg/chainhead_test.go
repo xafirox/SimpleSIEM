@@ -29,7 +29,7 @@ func TestChainHead_RoundTrip(t *testing.T) {
 		s.Write("auth", map[string]any{"event": "auth_failed", "user": "alice"})
 	}
 	s.Close()
-	time.Sleep(200 * time.Millisecond)
+	s.Flush()
 
 	signer, err := newChainHeadSigner(logDir, stateDir, time.Hour, nil)
 	if err != nil {

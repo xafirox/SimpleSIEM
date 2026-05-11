@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/shirou/gopsutil/v3/disk"
@@ -191,6 +192,19 @@ func runRestoreCmd(args []string) {
 		logDir:    *logDir,
 		force:     *force,
 	}
+	// Cross-platform path translation: when the backup's platform
+	// differs from the current platform, retarget any unset path to
+	// the current platform's defaults. Without this, restoring a
+	// Windows backup on Linux would extract into literal directory
+	// names containing colons and backslashes — Linux accepts the
+	// bytes, the daemon never reads them, and the operator gets a
+	// "successful" restore that did nothing useful.
+	preview, err := peekManifest(*in, passphrase)
+	if err != nil {
+		fatalf("read backup manifest: %v", err)
+	}
+	overrides = crossPlatformPathOverrides(preview, overrides)
+
 	m, err := restoreBackup(*in, passphrase, *dryRun, overrides)
 	if err != nil {
 		fatalf("restore: %v", err)
@@ -200,6 +214,18 @@ func runRestoreCmd(args []string) {
 	}
 	fmt.Printf("restore complete from backup created at %s UTC by %s/%s on %s\n",
 		m.CreatedAtUTC.Format("2006-01-02 15:04:05"), m.Platform, m.Arch, m.HostID)
+
+	// Post-restore identity rebind: rewrite path-shaped config fields
+	// for the current platform, re-issue the server cert under the
+	// LOCAL hostname (so peers verify it cleanly), drop self-pointing
+	// realm.peers entries, add the backup source as a peer (so a
+	// cross-swap auto-re-peers), and clear server.local_id (so the
+	// daemon stamps events with the local hostname). Best-effort: on
+	// any failure here a warning prints; the operator can fix
+	// manually before `simplesiem start`.
+	dest := resolveRestoreTargets(m, overrides)
+	applyPostRestoreRebind(filepath.Join(dest.configDir, "config.json"), m, dest)
+
 	fmt.Println("next steps:")
 	fmt.Println("  1. sudo simplesiem fix    # repair service registration if the OS changed")
 	fmt.Println("  2. sudo simplesiem start")

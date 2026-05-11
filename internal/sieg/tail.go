@@ -107,6 +107,28 @@ func runTail(args []string) {
 	}
 	fmt.Fprintf(os.Stderr, "tailing: %s  (times in %s)\n", scope, displayTZ())
 
+	// Agent-mode tail returns near-empty by default — every collector
+	// event ships to the server over mTLS, so on the agent host only
+	// `_agent` meta/errors live locally. Without this hint a first-
+	// time user runs `tail`, sees nothing flow even while opening
+	// browser tabs to google.com (the as7-test scenario), and
+	// reasonably assumes the agent stopped collecting. Print to
+	// stderr so the warning doesn't pollute pipelines reading stdout.
+	if normaliseMode(cfg.Mode) == "agent" && *hostFilter != "_agent" {
+		hostname, _ := os.Hostname()
+		id := cfg.Agent.ID
+		if id == "" {
+			id = hostname
+		}
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Note: this host is in AGENT mode. Collected events ship to the server")
+		fmt.Fprintln(os.Stderr, "over mTLS, so this `tail` mostly shows _agent lifecycle / shipping")
+		fmt.Fprintln(os.Stderr, "diagnostics. To see live collector events for this host:")
+		fmt.Fprintln(os.Stderr, "  - on the SERVER:  simplesiem tail --host", id)
+		fmt.Fprintln(os.Stderr, "  - locally only:   simplesiem tail --host _agent")
+		fmt.Fprintln(os.Stderr)
+	}
+
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
 	for range tick.C {
@@ -173,7 +195,13 @@ func (t *tailReader) printPretty(line []byte) {
 	}
 	ev := Event{TS: ts, Type: t.logType, Raw: string(line), Data: data}
 	summary := eventSummary(ev)
-	tsCol := displayTS(ts).Format("15:04:05.000")
+	// Per-line timestamp in HOST-LOCAL time (displayTS) with the TZ
+	// abbreviation appended. The header at startup already says "times
+	// in <TZ>" but operators piping `tail` into a file or scrolling
+	// past the header read the per-line column directly, and users
+	// flagged it as "not in local time" because there was no TZ
+	// marker on each line. Now every row carries it.
+	tsCol := displayTS(ts).Format("15:04:05.000") + " " + displayTZ()
 	hostCol := ""
 	if t.host != "" {
 		hostCol = fmt.Sprintf("%-12s ", t.host)

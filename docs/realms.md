@@ -270,7 +270,7 @@ If every server is down, the agent spools to disk under `<spool_dir>/`. Spool re
 
 ## Realm sync mechanics
 
-Each peer runs one pull goroutine per other peer in `realm.peers`. Every `sync_interval_seconds` (default 60), the goroutine:
+Each peer runs one pull goroutine per other peer in `realm.peers`. Every `sync_interval_seconds` (default 15), the goroutine:
 
 1. Reads its watermark from `<state>/realm/<peer-id>.watermark` (the most recent `received_at` it's seen from that peer).
 1. Calls `GET /v1/sync/events?since=<watermark>` on the peer.
@@ -294,7 +294,7 @@ This is what makes the realm self-heal as new peers join: the next sync cycle pr
 |---|---|
 | `server.realm.name` | realm identifier; default `"default"`. Operators can rename from any peer; the rename propagates via `/v1/sync/config`. |
 | `server.realm.peers` | list of peer server URLs in this realm. Each peer pulls events from every other peer on `sync_interval_seconds`. Empty = single-server realm. |
-| `server.realm.sync_interval_seconds` | how often peers replicate logs and reconcile realm config; default 60. |
+| `server.realm.sync_interval_seconds` | how often peers replicate logs and reconcile realm config; default 15. |
 | `server.realm.master_url` | optional URL of a master that owns this realm. Set automatically by `master enroll`. When non-empty, the server refuses local `realm rename` and `realm migrate` (use `master realm rename` / `master migrate-server` instead). Surfaced via `/v1/sync/config` so collectors can promote their authority from the server to the master. |
 | `server.realm.config_version` | unix-nanos timestamp used by the last-write-wins reconciliation. Set automatically; rarely edited by hand. |
 

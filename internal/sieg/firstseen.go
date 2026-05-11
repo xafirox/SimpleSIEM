@@ -105,18 +105,26 @@ func (d *firstSeenDetector) observe(host string, event map[string]any) int {
 		}
 		bucket[v] = now
 		emitted++
-		fields := map[string]any{
-			"event": "first_seen_" + field,
-			"host":  host,
-			"field": field,
-			"value": v,
-			"hint":  "first time this (host, " + field + ") tuple has been observed in the retention window",
+		// Build a fresh map per Write target. d.logger and d.onWrite
+		// each route to a different Storage with its own writer
+		// goroutine; sharing a single map between two writers races on
+		// the _seq/_prev/_hash stamping inside writeNow and corrupts
+		// the chain (the verifier reports "hash mismatch" on those
+		// lines). Same pattern as recordAgentHeartbeat above.
+		build := func() map[string]any {
+			return map[string]any{
+				"event": "first_seen_" + field,
+				"host":  host,
+				"field": field,
+				"value": v,
+				"hint":  "first time this (host, " + field + ") tuple has been observed in the retention window",
+			}
 		}
 		if d.logger != nil {
-			d.logger.Write("meta", fields)
+			d.logger.Write("meta", build())
 		}
 		if d.onWrite != nil {
-			d.onWrite(host, fields)
+			d.onWrite(host, build())
 		}
 	}
 	if emitted > 0 {

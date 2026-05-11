@@ -641,7 +641,7 @@ func (m *masterListenerState) handleEnrollCollector(w http.ResponseWriter, r *ht
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: er.CollectorID, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(m.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -740,7 +740,7 @@ func (m *masterListenerState) handleRotate(w http.ResponseWriter, r *http.Reques
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: caller, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(m.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},

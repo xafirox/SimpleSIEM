@@ -40,7 +40,13 @@ type attackPattern struct {
 	Tactic      string         `json:"tactic"`     // MITRE ATT&CK tactic ID (TA####)
 	Technique   string         `json:"technique"`  // MITRE technique (T####[.###])
 	Description string         `json:"description"`
-	compiled    *regexp.Regexp `json:"-"`
+	// Disabled keeps the pattern in the sidecar for an audit trail
+	// but stops it from compiling into the active set. Operators
+	// flip this with `simplesiem attack-patterns disable <name>`;
+	// the loader silently skips disabled entries so they don't
+	// cause false positives or false negatives.
+	Disabled bool `json:"disabled,omitempty"`
+	compiled *regexp.Regexp `json:"-"`
 }
 
 // coreAttackPatterns is the hardcoded baseline. Each pattern carries a
@@ -191,7 +197,7 @@ var coreAttackPatterns = []attackPattern{
 	// Overlong / invalid UTF-8 is detected at byte level — Go's RE2
 	// regex requires valid-UTF-8 string mode, so we can't express
 	// "byte 0xc0 followed by 0x80-0xbf" as a regex. See the structural
-	// scan in attackDetector.Scan().
+	// check in attackDetector.ScanAll().
 }
 
 // invalidUTF8Pattern is the synthetic pattern returned when the
@@ -241,7 +247,7 @@ func (d *attackDetector) LoadSidecar(path string) error {
 				return fmt.Errorf("parse: %w", err)
 			}
 			for _, p := range sidecar.Patterns {
-				if p.Regex == "" {
+				if p.Regex == "" || p.Disabled {
 					continue
 				}
 				re, err := regexp.Compile(p.Regex)
@@ -256,28 +262,6 @@ func (d *attackDetector) LoadSidecar(path string) error {
 	d.mu.Lock()
 	d.patterns = merged
 	d.mu.Unlock()
-	return nil
-}
-
-// Scan returns the FIRST matching pattern (or nil). Callers that want
-// every match can use ScanAll. Returning the first hit keeps the hot
-// path fast — one match is enough to flag the frame.
-func (d *attackDetector) Scan(frame string) *attackPattern {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	for i := range d.patterns {
-		if d.patterns[i].compiled == nil {
-			continue
-		}
-		if d.patterns[i].compiled.MatchString(frame) {
-			p := d.patterns[i]
-			return &p
-		}
-	}
-	if !validUTF8(frame) {
-		p := invalidUTF8Pattern
-		return &p
-	}
 	return nil
 }
 

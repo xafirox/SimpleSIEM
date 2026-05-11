@@ -324,7 +324,13 @@ func (s *serverState) peerAuthorized(r *http.Request) bool {
 // event since day zero.
 func (s *serverState) realmSyncLoop(ctx context.Context, _ []string, intervalSec int, tlsCfg *tls.Config) {
 	if intervalSec <= 0 {
-		intervalSec = 60
+		// 15s default. The sync exchanges trust+config (allowlist,
+		// master_cns, revocation tombstones) — every payload is small.
+		// At the previous 60s default an agent enrolled with one peer
+		// could not fail over to another for up to a minute, because
+		// the destination peer hadn't pulled the new allowlist entry
+		// yet. The MAMS multi-agents test exposed this as flake.
+		intervalSec = 15
 	}
 	stateDir := filepath.Join(defaultStateDir(), "realm")
 	_ = os.MkdirAll(stateDir, 0o750)
@@ -340,8 +346,10 @@ func (s *serverState) realmSyncLoop(ctx context.Context, _ []string, intervalSec
 	defer t.Stop()
 
 	// Run once after a short delay so an idle restart doesn't have to
-	// wait the full interval to start replicating.
-	first := time.NewTimer(5 * time.Second)
+	// wait the full interval to start replicating. 500ms is enough for
+	// TLS configs to settle but small enough that a fresh peer pulls
+	// the realm view sub-second.
+	first := time.NewTimer(500 * time.Millisecond)
 	defer first.Stop()
 
 	doSync := func() {
@@ -1011,7 +1019,7 @@ func (s *serverState) handleEnrollMaster(w http.ResponseWriter, r *http.Request)
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: er.MasterID, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(s.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},

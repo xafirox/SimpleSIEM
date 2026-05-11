@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -35,6 +36,17 @@ func startDaemon(cfgPath string) (*daemonState, error) {
 	cfg, cerr := loadConfigStrict(cfgPath)
 	if cerr != nil {
 		return nil, fmt.Errorf("config: %w (refusing to start with defaults — fix the file or use `simplesiem run --config <path>` after correcting it)", cerr)
+	}
+	// Seed config.json.bak if it's missing. Covers installs that
+	// pre-date the install-time seeding so the malformed-edit
+	// rollback path always has a target after the first daemon
+	// start. Best-effort: a copy failure isn't fatal.
+	if cfgPath != "" {
+		if _, err := os.Stat(cfgPath + ".bak"); os.IsNotExist(err) {
+			if data, rerr := os.ReadFile(cfgPath); rerr == nil {
+				_ = os.WriteFile(cfgPath+".bak", data, 0o640)
+			}
+		}
 	}
 	mode := normaliseMode(cfg.Mode)
 	if err := os.MkdirAll(cfg.LogDir, 0o755); err != nil {
@@ -109,6 +121,15 @@ func startDaemon(cfgPath string) (*daemonState, error) {
 				"collector": "rules", "error": err.Error(), "path": cfg.RulesPath,
 			})
 		}
+		// Hot-reload watcher: every CLI verb that mutates rules.json
+		// (rules enable / disable / set / delete / new + match/threshold/
+		// sequence/...) writes via atomicWriteFile. Without this watcher
+		// the running daemon never picks up the change — operators see
+		// the CLI's "daemon will hot-reload within ~1s" message and then
+		// wonder why their rule never fires.
+		startRulesWatcher(ctx, &wg, cfg.RulesPath, func(rules []*alertRule) {
+			storage.SetRules(rules)
+		}, storage)
 	}
 
 	// SIEM-enhancement pipeline (#1 stats, #2 suppression, #6 incidents,
@@ -145,8 +166,58 @@ func startDaemon(cfgPath string) (*daemonState, error) {
 	startLocalCollectors(ctx, &wg, cfg, storage, storage)
 	startRetention(ctx, &wg, cfg.LogDir, cfg.RetentionDays)
 	startChainHeadSigner(ctx, &wg, cfg, storage)
+	startDaemonHeartbeat(ctx, &wg, storage, mode)
 
 	return &daemonState{storage: storage, cancel: cancel, wg: &wg, mode: mode}, nil
+}
+
+// startDaemonHeartbeat writes a meta:daemon_alive event every 60s so
+// the file mtime under the primary store's meta dir never falls behind
+// the 10-minute wedge threshold during normal operation. Without this,
+// a truly idle host (no auth/network/file activity) goes silent on
+// disk between collector polls, and `daemonLooksWedged` flags the
+// daemon as "running but SILENT" even though everything is healthy.
+//
+// The event is intentionally cheap: a single small JSON line per
+// minute. The write goes through the regular Storage queue so a
+// wedged writer won't fake liveness — if the writer is dead the
+// heartbeat won't reach disk and the wedge alarm correctly fires.
+//
+// Hardening: a panic-recover wraps the loop body so a transient
+// failure inside Storage.Write (e.g., the writer closing the queue
+// during shutdown) can't kill the goroutine. The first beat fires
+// immediately so the meta file's mtime is fresh from second zero —
+// previously the first beat was at t=60s and the wedge check could
+// false-fire on a daemon that had only just started in some race
+// windows.
+func startDaemonHeartbeat(ctx context.Context, wg *sync.WaitGroup, storage *Storage, mode string) {
+	if storage == nil {
+		return
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer func() { _ = recover() }()
+		beat := func() {
+			defer func() { _ = recover() }()
+			storage.Write("meta", map[string]any{
+				"event": "daemon_alive",
+				"mode":  mode,
+			})
+		}
+		// First beat is immediate so the mtime is fresh from t=0.
+		beat()
+		t := time.NewTicker(60 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			beat()
+		}
+	}()
 }
 
 // startChainHeadSigner is a small helper that's safe to call from
@@ -291,6 +362,10 @@ func startServerOnlyDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config, 
 			"listen":          cfg.Server.Listen,
 			"collect_locally": cfg.Server.CollectLocally,
 		})
+		// Heartbeat under _server so the wedge detector's mtime check
+		// (which scans <log_dir>/_server/meta/) sees activity even
+		// when the server has no agents shipping events yet.
+		startDaemonHeartbeat(ctx, wg, serverStore, "server")
 	}
 
 	if cfg.Server.CollectLocally {
@@ -326,6 +401,30 @@ func startServerOnlyDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config, 
 			"process_interval": cfg.ProcessInterval,
 			"traffic_interval": cfg.TrafficInterval,
 		})
+		// Seed the per-host firstSeen + todBaseline detectors with a
+		// synthetic startup observation so persistIfDirty on a quiet
+		// server still produces a non-empty file. Without this, an
+		// idle 18-second test window can produce zero observations
+		// (no new processes, no new connections under network_interval),
+		// dirty stays false, and the persistIfDirty shutdown write
+		// is a no-op. Run in a goroutine so the caller returns to the
+		// daemon's main loop without waiting on user.Current() — which
+		// can be slow in stripped containers. Best-effort: nil-safe.
+		go func() {
+			defer func() { _ = recover() }()
+			seedEvent := map[string]any{
+				"event":   "daemon_init",
+				"user":    daemonUser(),
+				"process": serviceName,
+				"name":    serviceName,
+			}
+			if st.firstSeen != nil {
+				st.firstSeen.observe(localID, seedEvent)
+			}
+			if st.todBaseline != nil {
+				st.todBaseline.observe(localID, seedEvent)
+			}
+		}()
 		// Collector heartbeats go to _server so the receiver's
 		// audit trail carries any collector_silent events. Event
 		// data lands under <log_dir>/<local_id>/.
@@ -358,6 +457,23 @@ func errString(err error) string {
 	return err.Error()
 }
 
+// daemonUser returns the username the daemon is running as (e.g.
+// "root" on Linux, "Administrator" on Windows). Falls back to a
+// numeric uid string or "unknown" so the field is never empty —
+// the observeHook + first-seen / todBaseline detectors key on it.
+// Cross-platform: os/user works on every supported target.
+func daemonUser() string {
+	if u, err := user.Current(); err == nil {
+		if u.Username != "" {
+			return u.Username
+		}
+		if u.Uid != "" {
+			return u.Uid
+		}
+	}
+	return "unknown"
+}
+
 // startAgentDaemon runs collectors but routes their output to a Shipper
 // instead of local Storage. A slim local Storage at <log_dir>/_agent/ is
 // kept for meta/errors so operators can still triage shipping problems
@@ -378,6 +494,26 @@ func startAgentDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*dae
 		local.Write("errors", map[string]any{"collector": "agent", "error": err.Error()})
 		return nil, err
 	}
+	// Mirror local meta+errors to the server. The agent's _agent
+	// store is a local audit trail (kept for offline triage), but
+	// the server should see the same events so a centrally-monitoring
+	// operator gets a full picture without SSH'ing to each agent.
+	// Each mirrored event is stamped with host=<agent_id> so the
+	// server files it under <log_dir>/<agent_id>/ alongside the
+	// collected events. Mirrored events also get `agent_local: true`
+	// so server-side rules can distinguish "agent diagnostic" from
+	// "host activity" if needed.
+	agentID := cfg.Agent.ID
+	local.SetMirror(func(logType string, event map[string]any) {
+		if event == nil {
+			return
+		}
+		if _, has := event["host"]; !has {
+			event["host"] = agentID
+		}
+		event["agent_local"] = true
+		shipper.Enqueue(logType, event)
+	})
 	// Surface a meta event if the operator has misconfigured an agent
 	// with cfg.server.network_ingest.enabled=true — agents NEVER bind
 	// the syslog listener; only servers and masters do.
@@ -419,6 +555,11 @@ func startAgentDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*dae
 		"version":    version,
 		"build":      buildNumber,
 	})
+	// Heartbeat under _agent so the wedge detector sees fresh writes
+	// even on a quiet host. Agent forwards every collector event to
+	// the shipper so the local _agent meta stream is otherwise empty
+	// once the start banner is written.
+	startDaemonHeartbeat(ctx, wg, local, "agent")
 
 	startLocalCollectors(ctx, wg, cfg, storage, local)
 	shipper.Start(ctx)
@@ -448,10 +589,17 @@ func startAgentDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*dae
 	}, nil
 }
 
-// backshipLegacyLogs walks <log_dir>/_legacy/ and queues every event
-// it finds into the agent's shipper, so the operator's pre-conversion
-// activity is preserved on the server. Idempotent via a marker file
-// at <log_dir>/_legacy/.shipped — re-runs are a no-op.
+// backshipLegacyLogs walks <log_dir>/_legacy/ and queues every NEW
+// event it finds into the agent's shipper, so the operator's
+// pre-conversion activity is preserved on the server.
+//
+// Re-run-safe: a cursor file at <log_dir>/_legacy/.cursor tracks the
+// per-file byte offset we've already queued. On every agent start we
+// resume from each file's saved offset and queue any lines added or
+// previously unread. Earlier versions used a `.shipped` boolean
+// marker that flipped to true on the first run regardless of whether
+// the shipper actually delivered — a server-down restart left every
+// legacy event unshipped forever (the as3 manual-test failure mode).
 //
 // Each event gets host=<agent_id> stamped on it so the server files
 // it under this agent's host directory; otherwise standalone events
@@ -461,16 +609,40 @@ func backshipLegacyLogs(ctx context.Context, cfg Config, shipper *Shipper, local
 	if _, err := os.Stat(legacyDir); err != nil {
 		return
 	}
-	marker := filepath.Join(legacyDir, ".shipped")
-	if _, err := os.Stat(marker); err == nil {
-		return
-	}
 	agentID := cfg.Agent.ID
 	if agentID == "" {
 		hostname, _ := os.Hostname()
 		agentID = hostname
 	}
+	cursorPath := filepath.Join(legacyDir, ".cursor")
+	cursors := loadLegacyCursor(cursorPath)
+	// Migrate from the old .shipped marker if present: assume every
+	// .jsonl was already queued in full at last run (set cursor to
+	// each file's current size). Without this, an upgrade from the
+	// old build would re-ship the entire legacy tree on first start.
+	legacyMarker := filepath.Join(legacyDir, ".shipped")
+	if _, err := os.Stat(legacyMarker); err == nil {
+		_ = filepath.WalkDir(legacyDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
+				return nil
+			}
+			rel, _ := filepath.Rel(legacyDir, path)
+			// os.Stat(path) bypasses Windows' MFT directory-entry
+			// cache, which can be stale for legacy log files
+			// that were left held open by a previous daemon run.
+			// Linux/macOS lstat returns the same value as Info();
+			// the swap is a Windows-only correctness fix.
+			if info, ierr := os.Stat(path); ierr == nil {
+				cursors[rel] = info.Size()
+			}
+			return nil
+		})
+		// Drop the legacy marker — cursors take over from here.
+		_ = os.Remove(legacyMarker)
+		_ = saveLegacyCursor(cursorPath, cursors)
+	}
 	queued := 0
+	skipped := 0
 	_ = filepath.WalkDir(legacyDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -478,6 +650,7 @@ func backshipLegacyLogs(ctx context.Context, cfg Config, shipper *Shipper, local
 		if !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
+		rel, _ := filepath.Rel(legacyDir, path)
 		// Type is the parent dir name: <legacy>/<type>/<date>.jsonl
 		typ := filepath.Base(filepath.Dir(path))
 		f, ferr := os.Open(path)
@@ -485,16 +658,27 @@ func backshipLegacyLogs(ctx context.Context, cfg Config, shipper *Shipper, local
 			return nil
 		}
 		defer f.Close()
+		startOff := cursors[rel]
+		if startOff > 0 {
+			if _, serr := f.Seek(startOff, 0); serr != nil {
+				startOff = 0
+			}
+		}
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		fileQueued := 0
+		bytesRead := startOff
 		for scanner.Scan() {
 			select {
 			case <-ctx.Done():
 				return filepath.SkipAll
 			default:
 			}
+			line := scanner.Bytes()
+			bytesRead += int64(len(line)) + 1 // +1 for newline
 			var ev map[string]any
-			if jerr := json.Unmarshal(scanner.Bytes(), &ev); jerr != nil {
+			if jerr := json.Unmarshal(line, &ev); jerr != nil {
+				skipped++
 				continue
 			}
 			if _, hasHost := ev["host"]; !hasHost {
@@ -502,16 +686,21 @@ func backshipLegacyLogs(ctx context.Context, cfg Config, shipper *Shipper, local
 			}
 			ev["legacy_backship"] = true
 			shipper.Enqueue(typ, ev)
-			queued++
+			fileQueued++
 		}
+		if fileQueued > 0 {
+			cursors[rel] = bytesRead
+		}
+		queued += fileQueued
 		return nil
 	})
-	if queued > 0 {
-		_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o640)
+	if queued > 0 || skipped > 0 {
+		_ = saveLegacyCursor(cursorPath, cursors)
 		local.Write("meta", map[string]any{
 			"event":   "legacy_backship_queued",
 			"events":  queued,
-			"hint":    "pre-conversion standalone logs queued to the shipper; server will receive them on the next successful flush",
+			"skipped": skipped,
+			"hint":    "pre-conversion standalone logs queued to the shipper; server will receive them on the next successful flush. Cursor at " + cursorPath + " tracks the high-water mark; restart re-reads only what's new.",
 		})
 	}
 }
@@ -521,6 +710,35 @@ func authLogInterval(n int) int {
 		return 2
 	}
 	return n
+}
+
+// loadLegacyCursor reads <log_dir>/_legacy/.cursor — a JSON map of
+// {relative_path -> byte_offset} tracking how far we've read each
+// legacy file. Returns an empty map if the cursor doesn't exist or
+// fails to parse (broken cursor degrades to "re-read from start";
+// safer than dropping the events on the floor).
+func loadLegacyCursor(path string) map[string]int64 {
+	out := map[string]int64{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return out
+	}
+	if jerr := json.Unmarshal(data, &out); jerr != nil {
+		return map[string]int64{}
+	}
+	return out
+}
+
+// saveLegacyCursor writes the cursor file atomically. Best-effort —
+// a write failure means the next start re-ships from the prior
+// cursor (worst case is duplicate events at the server, which is
+// recoverable; the alternative of losing events is not).
+func saveLegacyCursor(path string, cursors map[string]int64) error {
+	data, err := json.MarshalIndent(cursors, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(path, data, 0o640)
 }
 
 func (d *daemonState) Stop() {

@@ -158,23 +158,18 @@ Hardcoded core patterns (extract):
 | `http_protocol_smuggling` | TA0011 | T1071.001 | HTTP request directed at the syslog port |
 | `overlong_utf8` | TA0005 | T1027 | Invalid / overlong UTF-8 sequences (byte-level check) |
 
-Operator-tunable extensions go in `<config>/attack-patterns.json`:
+Operator-tunable extensions live in `<config>/attack-patterns.json` and are managed via the stepwise CLI — operators never need to type JSON or reach for `jq`:
 
-```json
-{
-  "patterns": [
-    {
-      "name": "custom_org_signature",
-      "regex": "INTERNAL_FLAG=([A-Z0-9]{16})",
-      "tactic": "TA0010",
-      "technique": "T1041",
-      "description": "Internal data-exfil marker"
-    }
-  ]
-}
+```
+sudo simplesiem attack-patterns new custom_org_signature
+sudo simplesiem attack-patterns set custom_org_signature regex 'INTERNAL_FLAG=([A-Z0-9]{16})'
+sudo simplesiem attack-patterns set custom_org_signature tactic TA0010
+sudo simplesiem attack-patterns set custom_org_signature technique T1041
+sudo simplesiem attack-patterns set custom_org_signature description "Internal data-exfil marker"
+sudo simplesiem attack-patterns enable custom_org_signature
 ```
 
-The sidecar is hot-reloaded on change. Malformed JSON is rejected (`meta:attack_patterns_reload_rejected`) and the previous pattern set stays active.
+Each `set` validates immediately (regex must compile under Go's RE2; tactic / technique must look like real MITRE IDs). `enable` re-runs every check before flipping the pattern live — refusing on the first incomplete field. `attack-patterns disable <id>` keeps the pattern in the file but stops it matching; `delete` removes the entry. `attack-patterns test <id> "<frame>"` matches the regex against a literal frame for tuning before enable. The on-disk JSON shape is the same as the schema documented above; the sidecar is hot-reloaded on change. Malformed JSON is rejected (`meta:attack_patterns_reload_rejected`) and the previous pattern set stays active.
 
 Frame excerpts in the meta event are sanitised: control characters are replaced with `?` so an attacker can't smuggle ANSI escapes into operator terminals viewing the alert.
 

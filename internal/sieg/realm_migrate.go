@@ -781,7 +781,15 @@ func startPendingJoinWatcher(ctx context.Context, cfgPath string, mst *Storage) 
 			if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
 				continue
 			}
-			runRealmJoin([]string{peer, "--key", psk, "--yes", "--config", cfgPath})
+			// --no-restart: we're inside the running daemon. The CLI
+			// path's auto-restart would call stopCommand on this
+			// service from within the service, killing pendingJoinWatcher
+			// before startCommand can fire (the Windows-service
+			// failure path that left R1S2 in Stopped state during
+			// MMR migration tests). Trust bundle is dynamic per
+			// GetConfigForClient, so no restart needed for the new
+			// realm CA to take effect.
+			runRealmJoin([]string{peer, "--key", psk, "--yes", "--no-restart", "--config", cfgPath})
 			allowlistEditMu.Lock()
 			cfg2 := loadConfig(cfgPath)
 			cfg2.Server.Realm.PendingJoinPeer = ""

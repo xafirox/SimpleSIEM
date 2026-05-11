@@ -600,10 +600,16 @@ type AlertEscalationConfig struct {
 // VolumeAnomalyConfig tunes the per-agent volume-drop detector. Zero
 // values mean "use the built-in default."
 type VolumeAnomalyConfig struct {
-	MinBaseline float64 `json:"min_baseline"`         // events/min below which we never fire (default 5)
-	DropRatio   float64 `json:"drop_ratio"`           // current/baseline ratio that counts as "quiet" (default 0.05)
-	Consecutive int     `json:"consecutive_low_mins"` // minutes-low in a row before firing (default 2)
-	CooldownMins int    `json:"cooldown_minutes"`     // per-agent re-fire suppression window (default 30)
+	MinBaseline  float64 `json:"min_baseline"`         // events/min below which we never fire (default 5)
+	DropRatio    float64 `json:"drop_ratio"`           // current/baseline ratio that counts as "quiet" (default 0.05)
+	Consecutive  int     `json:"consecutive_low_mins"` // minutes-low in a row before firing (default 2)
+	CooldownMins int     `json:"cooldown_minutes"`     // per-agent re-fire suppression window (default 30)
+	// SilenceMins is the absolute-silence threshold used by the
+	// complementary agent_silence detector — fires when an
+	// allowlisted agent hasn't been heard from for this many minutes,
+	// regardless of whether the EWMA-based volume detector built up
+	// a baseline. Default 5; set to 0 to keep the default.
+	SilenceMins int `json:"silence_minutes"`
 }
 
 // AlertSyslogConfig describes the optional RFC 5424 forwarder. Populated
@@ -639,6 +645,63 @@ type RealmConfig struct {
 	PendingJoinPSK  string `json:"pending_join_psk,omitempty"`
 }
 
+// windowsUserProfileWatches returns per-user file watches under C:\Users:
+// Downloads (catches browser drops), Desktop, Documents, and the per-user
+// Startup folder (persistence). Skips system metadata profiles (Default,
+// Public, defaultuser*). Returns nil on non-Windows or if C:\Users is
+// unreadable. Paths that don't exist are tolerated by the FileCollector.
+func windowsUserProfileWatches() []string {
+	if runtime.GOOS != "windows" {
+		return nil
+	}
+	drive := os.Getenv("SystemDrive")
+	if drive == "" {
+		drive = "C:"
+	}
+	usersRoot := drive + `\Users`
+	entries, err := os.ReadDir(usersRoot)
+	if err != nil {
+		return nil
+	}
+	skip := map[string]bool{
+		"default":      true,
+		"default user": true,
+		"public":       true,
+		"all users":    true,
+	}
+	var paths []string
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := strings.ToLower(e.Name())
+		if skip[name] || strings.HasPrefix(name, "defaultuser") {
+			continue
+		}
+		profile := filepath.Join(usersRoot, e.Name())
+		paths = append(paths,
+			filepath.Join(profile, "Downloads"),
+			filepath.Join(profile, "Desktop"),
+			filepath.Join(profile, "Documents"),
+			filepath.Join(profile, "AppData", "Roaming", "Microsoft", "Windows", "Start Menu", "Programs", "Startup"),
+		)
+	}
+	return paths
+}
+
+// defaultAuthLogPaths returns the platform-appropriate default
+// auth_log_paths seed. Only Linux has a real file-tailer for auth logs;
+// macOS uses the unified-log subprocess (no path list), Windows uses
+// wevtutil. Returning Linux paths on non-Linux populates config.json
+// with entries that `simplesiem auth-log list` displays but the daemon
+// never reads — a real operator UX trap.
+func defaultAuthLogPaths() []string {
+	if runtime.GOOS == "linux" {
+		return []string{"/var/log/auth.log", "/var/log/secure", "/var/log/messages"}
+	}
+	return nil
+}
+
 func defaultConfig() Config {
 	// Intervals are aggressive enough to catch most admin commands
 	// (apt-get run, curl, ssh login). Bump them up in config.json if CPU is
@@ -654,12 +717,14 @@ func defaultConfig() Config {
 		FilePollInterval:   30,
 		AuthInterval:       5,
 		ProcessInterval:    2,
-		TrafficInterval:    30, // host_io rollups are coarse; no need for 2s cadence
+		TrafficInterval:    10, // host_io rollups; 10s lets interactive `ping; triage` workflows land within ~10s instead of waiting up to half a minute
 		AuthLogInterval:    2,
 		// auth_log_paths is only consulted on Linux. macOS uses unified
-		// logging via `log stream`; Windows currently has no auth-log
-		// implementation.
-		AuthLogPaths:       []string{"/var/log/auth.log", "/var/log/secure", "/var/log/messages"},
+		// logging via `log stream`; Windows uses wevtutil. Seeding the
+		// Linux defaults on macOS / Windows would show those paths in
+		// `simplesiem auth-log list`, confusing operators on a host
+		// where they're never read. Default to empty on non-Linux.
+		AuthLogPaths:       defaultAuthLogPaths(),
 		RulesPath:          filepath.Join(defaultConfigDir(), "rules.json"),
 		MaxLogFileMB:       256,
 		WriteQueueSize:     4096,
@@ -717,7 +782,7 @@ func defaultConfig() Config {
 				// into an HA group; the name is changeable from any
 				// server in the realm (and syncs to peers in Phase B).
 				Name:                "default",
-				SyncIntervalSeconds: 60,
+				SyncIntervalSeconds: 15,
 			},
 			// Network-device ingest is ON by default. The allowlist
 			// starts empty (only the host's own gateway is auto-added
@@ -757,17 +822,39 @@ func defaultConfig() Config {
 	}
 	switch runtime.GOOS {
 	case "windows":
+		// Windows fsnotify uses ReadDirectoryChangesW per-directory —
+		// there is no native recursive watch. Recursively watching
+		// C:\Users or C:\ProgramData therefore requires adding an
+		// individual watch for every subdirectory in those trees,
+		// which on a typical Windows host can be tens of thousands
+		// of paths and minutes of walk time. During that walk the
+		// FileCollector goroutine doesn't heartbeat (its
+		// fsnotify-event read loop hasn't started yet), so an idle
+		// install appears completely silent for ~5 minutes after
+		// startup and a `simplesiem stop` blocks until the walk
+		// completes (the user's STOP_PENDING symptom).
+		//
+		// The defaults below pick the actual persistence and
+		// security-sensitive paths — small, recursable trees only.
+		// Operators who genuinely need full C:\Users coverage can
+		// add it explicitly via `simplesiem watch add`, accepting
+		// the resource cost.
 		root := os.Getenv("SystemRoot")
 		if root == "" {
 			root = `C:\Windows`
 		}
-		c.FileWatchPaths = []string{
-			filepath.Join(root, `System32`, `drivers`, `etc`), // hosts, services
-			`C:\ProgramData`,
-			`C:\Users`,
-			filepath.Join(root, `Temp`),
-			filepath.Join(root, `System32`, `Tasks`), // scheduled tasks (persistence)
+		programData := os.Getenv("ProgramData")
+		if programData == "" {
+			programData = `C:\ProgramData`
 		}
+		c.FileWatchPaths = []string{
+			filepath.Join(root, `System32`, `drivers`, `etc`),                                         // hosts, services
+			filepath.Join(root, `System32`, `Tasks`),                                                  // scheduled-task persistence
+			filepath.Join(programData, `Microsoft`, `Windows`, `Start Menu`, `Programs`, `StartUp`),   // system-wide startup folder
+			filepath.Join(root, `System32`, `WindowsPowerShell`, `v1.0`, `profile.ps1`),                // PowerShell profile (file, not dir; watched via parent)
+			filepath.Join(root, `Temp`),                                                                // write-activity hotspot
+		}
+		c.FileWatchPaths = append(c.FileWatchPaths, windowsUserProfileWatches()...)
 	case "darwin":
 		c.FileWatchPaths = []string{
 			"/etc", "/private/etc",
@@ -803,11 +890,38 @@ func defaultConfig() Config {
 	return c
 }
 
+// configParseError is the typed error returned by loadConfigStrict
+// when config.json fails JSON parsing. Carrying the path, the
+// underlying json error, and the computed line/col lets callers print
+// a loud banner via printMalformedConfigBanner — without a typed
+// error, the same parse failure would render as a single-line "daemon:
+// config: ... is not valid JSON" log entry that operators have
+// repeatedly missed.
+type configParseError struct {
+	Path string
+	Err  error
+	Line int // 1-indexed, 0 when the json error didn't expose an offset
+	Col  int
+}
+
+func (e *configParseError) Error() string {
+	if e.Line > 0 {
+		return fmt.Sprintf("%s is not valid JSON at line %d col %d: %v", e.Path, e.Line, e.Col, e.Err)
+	}
+	return fmt.Sprintf("%s is not valid JSON: %v", e.Path, e.Err)
+}
+
+func (e *configParseError) Unwrap() error { return e.Err }
+
 // loadConfigStrict is the loader the daemon and start preflight use:
 // any parse error is returned, NOT silently fallen back to defaults.
 // A malformed config used to flip the daemon to standalone mode
 // without anyone noticing — operators trusted that the mode they set
 // last week was still active.
+//
+// On parse failure the returned error is a *configParseError so the
+// caller can print a multi-line banner via printMalformedConfigBanner
+// (which also names the `<path>.bak` recovery when one parses cleanly).
 func loadConfigStrict(path string) (Config, error) {
 	c := defaultConfig()
 	if path == "" {
@@ -821,12 +935,143 @@ func loadConfigStrict(path string) (Config, error) {
 		return c, fmt.Errorf("read %s: %w", path, err)
 	}
 	if jerr := json.Unmarshal(data, &c); jerr != nil {
-		return c, fmt.Errorf("%s is not valid JSON: %w", path, jerr)
+		pe := &configParseError{Path: path, Err: jerr}
+		if se, ok := jerr.(*json.SyntaxError); ok {
+			pe.Line, pe.Col = byteOffsetToLineCol(data, int(se.Offset))
+		}
+		return c, pe
 	}
 	if v := os.Getenv("SIMPLESIEM_LOG_DIR"); v != "" {
 		c.LogDir = v
 	}
 	return c, nil
+}
+
+// printMalformedConfigBanner writes a hard-to-miss multi-line block to
+// stderr describing a config-parse failure: red-bordered banner, parse
+// location, and the exact recovery command (`.bak` rollback when
+// available, hand-edit / reinstall when not). Falls back to the
+// underlying error message when err isn't a *configParseError so the
+// caller can use a single reporting path. Always returns — caller
+// decides whether to exit.
+//
+// The banner is colorised only when stderr is a TTY (same gate as the
+// rest of the CLI). In a service / journald context the colours are
+// stripped and the banner remains a plain multi-line block, which is
+// still much more visible than the previous "daemon: config: ..." log
+// line the failure used to render as.
+func printMalformedConfigBanner(err error) {
+	pe, ok := err.(*configParseError)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return
+	}
+	red := func(s string) string {
+		// Mirror useColor() but check stderr because that's where
+		// this banner goes. Service hosts (Windows SCM, systemd)
+		// typically don't expose a TTY here, so colours auto-disable
+		// and the banner still reads cleanly.
+		if colorDisabled {
+			return s
+		}
+		if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+			return s
+		}
+		fi, err := os.Stderr.Stat()
+		if err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+			return s
+		}
+		return colRed + colBold + s + colReset
+	}
+	bar := strings.Repeat("=", 72)
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, red(bar))
+	fmt.Fprintln(os.Stderr, red("  CONFIG ERROR — config.json is not valid JSON, daemon refuses to start"))
+	fmt.Fprintln(os.Stderr, red(bar))
+	fmt.Fprintf(os.Stderr, "  file:        %s\n", pe.Path)
+	if pe.Line > 0 {
+		fmt.Fprintf(os.Stderr, "  parse error: line %d col %d  (%v)\n", pe.Line, pe.Col, pe.Err)
+	} else {
+		fmt.Fprintf(os.Stderr, "  parse error: %v\n", pe.Err)
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  Recovery options:")
+	bak := pe.Path + ".bak"
+	if data, rerr := os.ReadFile(bak); rerr == nil {
+		var probe Config
+		if jerr := json.Unmarshal(data, &probe); jerr == nil {
+			fmt.Fprintln(os.Stderr, "    1) Roll back to the previous valid config (saved automatically):")
+			fmt.Fprintf(os.Stderr, "         cp %s %s\n", bak, pe.Path)
+			fmt.Fprintln(os.Stderr, "    2) OR open the file and fix the JSON syntax at the line above.")
+		} else {
+			fmt.Fprintf(os.Stderr, "    -  %s exists but ALSO fails to parse (%v)\n", bak, jerr)
+			fmt.Fprintf(os.Stderr, "    1) Open %s and fix the JSON syntax by hand.\n", pe.Path)
+			fmt.Fprintln(os.Stderr, "    2) OR reinstall to drop a fresh default config:")
+			fmt.Fprintln(os.Stderr, "         simplesiem install --mode <standalone|agent|server|master|collector>")
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "    -  no backup found at %s\n", bak)
+		fmt.Fprintf(os.Stderr, "    1) Open %s and fix the JSON syntax by hand.\n", pe.Path)
+		fmt.Fprintln(os.Stderr, "    2) OR reinstall to drop a fresh default config:")
+		fmt.Fprintln(os.Stderr, "         simplesiem install --mode <standalone|agent|server|master|collector>")
+	}
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, "  Refusing to fall back to defaults: that could expose an open allowlist,")
+	fmt.Fprintln(os.Stderr, "  the wrong listen address, or a stale realm name silently.")
+	fmt.Fprintln(os.Stderr, red(bar))
+	fmt.Fprintln(os.Stderr)
+}
+
+// reportStartupError prints err in the most operator-friendly form
+// available. *configParseError gets the loud banner via
+// printMalformedConfigBanner; everything else falls through to the
+// usual "error: <msg>" line so we don't accidentally suppress the
+// detail of unrelated failures (cert-missing, listen-bind, etc.).
+func reportStartupError(err error) {
+	if _, ok := err.(*configParseError); ok {
+		printMalformedConfigBanner(err)
+		return
+	}
+	// Some startup errors wrap the parse error (preflight: ...). Walk
+	// the chain so the banner still fires.
+	if cur := err; cur != nil {
+		for {
+			if pe, ok := cur.(*configParseError); ok {
+				printMalformedConfigBanner(pe)
+				return
+			}
+			type unwrapper interface{ Unwrap() error }
+			if u, ok := cur.(unwrapper); ok {
+				cur = u.Unwrap()
+				continue
+			}
+			break
+		}
+	}
+	fmt.Fprintf(os.Stderr, "error: %v\n", err)
+}
+
+// byteOffsetToLineCol converts a byte offset into a 1-indexed (line,
+// col) for human-friendly parse-error messages. Returns (1,1) when
+// the offset is out of range — the operator still gets a message,
+// just less precise.
+func byteOffsetToLineCol(data []byte, off int) (int, int) {
+	if off < 0 {
+		off = 0
+	}
+	if off > len(data) {
+		off = len(data)
+	}
+	line, col := 1, 1
+	for i := 0; i < off; i++ {
+		if data[i] == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+	}
+	return line, col
 }
 
 func loadConfig(path string) Config {
@@ -1014,19 +1259,11 @@ func Run() {
 	case "incidents":
 		runIncidentsCmd(subArgs)
 	case "threatintel":
-		if len(subArgs) > 0 && subArgs[0] == "status" {
-			runThreatIntelStatus(subArgs[1:])
-		} else {
-			fmt.Fprintln(os.Stderr, "usage: simplesiem threatintel status")
-			os.Exit(2)
-		}
+		runThreatIntelCmd(subArgs)
 	case "firstseen":
-		if len(subArgs) > 0 && subArgs[0] == "status" {
-			runFirstSeenStatus(subArgs[1:])
-		} else {
-			fmt.Fprintln(os.Stderr, "usage: simplesiem firstseen status")
-			os.Exit(2)
-		}
+		runFirstSeenCmd(subArgs)
+	case "attack-patterns":
+		runAttackPatternsCmd(subArgs)
 	case "mitre":
 		runMitreCmd(subArgs)
 	case "triage-pivot":
@@ -1040,8 +1277,39 @@ func Run() {
 		}
 	case "honey":
 		runHoneyCmd(subArgs)
+	case "config":
+		runConfigCmd(subArgs)
+	case "alerts-cfg":
+		// Alert delivery / escalation tuning. The plain `alerts`
+		// command is a triage / ack surface; alert-DELIVERY config
+		// lives under a separate verb so completion + help don't
+		// mix the two audiences.
+		runAlertsCfgCmd(subArgs)
+	case "trust":
+		// Per-server / per-collector trust gates that grant the
+		// master destructive privileges. Replaces hand-edits of
+		// server.master_can_rotate_ca / master_can_uninstall.
+		runTrustCmd(subArgs)
+	case "tune":
+		// Operator-tunable knobs that don't fit a domain verb (agent
+		// batch sizing, retention days, max log file MB, etc.).
+		runTuneCmd(subArgs)
+	case "storage-cfg":
+		// Storage thresholds + failover-volume management.
+		runStorageCfgCmd(subArgs)
+	case "watch":
+		// File-watch path management (cfg.file_watch_paths).
+		runWatchCmd(subArgs)
+	case "auth-log":
+		// Auth-log path management (cfg.auth_log_paths) — Linux only
+		// in practice, but the CLI is cross-platform.
+		runAuthLogCmd(subArgs)
 	case "network-source":
 		runNetworkSourceCmd(subArgs)
+	case "network-ingest":
+		// Listener / cert-mode / per-source-rate-limit knobs that
+		// previously required jq edits to cfg.server.network_ingest.
+		runNetworkIngestCmd(subArgs)
 	case "net-send":
 		runNetSendCmd(subArgs)
 	case "probe":
@@ -1146,26 +1414,63 @@ func usage() {
 
 usage: simplesiem <command> [flags]
 
-commands:
-  install      install as a system service (starts now + at boot)
-  uninstall    stop and remove the service
-  start        start the installed service
-  stop         stop the running service
-  restart      stop + start in one shot (skips stop if not running)
-  fix          audit the install and repair anything broken (--dry-run to check only)
-  run          run the collector daemon (invoked by the service)
-  query        filter stored logs: --type, --since, --until, --grep, --limit
-  triage       pivot on an event and show surrounding activity (±window)
-  tail         follow new events live (filters: --type, --grep, --alerts)
-  alerts       show recent alerts with severity colours
-  rules        check / test rule definitions: simplesiem rules <check|test>
-  verify       walk the hash chain in stored logs, report any tampering
-  certs        manage the bundled PKI: simplesiem certs <init|server|sign>
-  convert      switch this install's mode: simplesiem convert <agent|server|standalone|master|collector>
-  master       master-mode operator commands: simplesiem master <enroll|collector|...>
-  collector    collector-mode operator commands: simplesiem collector <enroll|status|...>
-  status       show log volume, rule count, retention, last collector beat
-  version      print version + build number
+lifecycle:
+  install                  install as a system service (starts now + at boot)
+  uninstall                stop and remove the service
+  start / stop / restart   service control
+  fix                      audit the install and repair (--dry-run to check only)
+  run                      run the daemon (invoked by the service)
+  status                   show log volume, rule count, retention, peer state
+  version                  print version + build number
+
+read-only:
+  query                    filter stored logs: --type, --since, --until, --grep, --limit
+  triage / search          pivot on an event and show surrounding activity (±window)
+  tail                     follow new events live (--type, --grep, --alerts, --json, --host)
+  alerts                   show recent alerts with severity colours; alerts ack <hash>
+  top                      top-N aggregation across the corpus (--by <field>)
+  tree                     reconstruct process trees from process_start events
+  hunt                     rare / pivot / firstseen + hunt save/run/list/delete
+  verify                   walk the hash chain; report tampering or truncation
+  chainhead                manage signed chain heads (verify, list)
+  incidents                list / show incident groupings
+  baseline / firstseen / threatintel    'status' subcommand for each detector
+
+config / mutation:
+  config <get|set|list|edit|unset>      generic dotted-key access to config.json
+  alerts-cfg <webhook|syslog|escalation|bearer>   alert dispatcher posture
+  trust <show|grant|revoke>             master-trust opt-in gates
+  tune <agent|server|master|retention|...>        tunable scalars
+  storage-cfg <show|warn|halt|failover>            storage thresholds + failover
+  watch <list|add|remove|recursive|...>            file_watch_paths
+  auth-log <list|add|remove|interval>              auth_log_paths
+  network-source <add|remove|list|rename|vendors>   per-device allowlist
+  network-ingest <show|enable|disable|tls-listen|...>  listener posture
+  attack-patterns <new|set|enable|disable|delete|list|show|test|validate>
+                                          operator-extensible regex pattern set (sidecar)
+  threatintel <status|feed <new|set|kinds|enable|disable|delete|list|show|validate>>
+                                          IOC feed management (no jq required)
+  firstseen <status|tuple <add|remove|fields|list|show>>
+                                          first-seen tuple definitions
+  rules <list|show|new|set|match|threshold|sequence-step|enable|disable|delete|...>
+                                          stepwise rule builder + lifecycle
+
+mode-specific:
+  certs <init|server|psk|revoke|...>    bundled PKI
+  convert <agent|server|standalone|master|collector>   switch mode in place
+  master <enroll|push-rules|collector|migrate-server|uninstall-all|...>
+  collector <enroll|status|interval|promote|repair|master|...>
+  realm <join|leave|rename|status|...>
+  agent (no top-level surface — use convert agent / tune agent / certs)
+  server <query-collector>              server-side collector queries
+  honey <add|remove|list>               honey-token lifecycle
+  mitre <catalog|coverage|fetch|generate-rules>
+
+backup / migration:
+  backup <out|verify|--all|--all-realms|--agent>
+  restore <in>
+  log-dir migrate <new-path>
+  net-send / probe                       diagnostic helpers
 
 Mode is chosen via the "mode" key in config.json: "standalone" (default —
 collect locally), "agent" (collect and forward to a server over mTLS),
@@ -1185,5 +1490,14 @@ examples:
   simplesiem triage --pid 1234 --window 10s
   simplesiem triage --grep evil.com --window 30s
   simplesiem triage --at 2026-04-24T13:48:35Z --window 15s
+
+  simplesiem alerts-cfg webhook add https://example.com/hook --min-severity high
+  simplesiem trust grant rotate-ca
+  simplesiem tune retention 90
+  simplesiem rules new ssh-brute && simplesiem rules set ssh-brute severity high
+  simplesiem attack-patterns new my-token && simplesiem attack-patterns set my-token regex 'X-Honey'
+  simplesiem threatintel feed new abuse-ch && simplesiem threatintel feed set abuse-ch url https://...
+  simplesiem firstseen tuple add user_country user,geoip.country
+  simplesiem certs unrevoke list
 `, versionString())
 }

@@ -197,6 +197,22 @@ func rdnsTTLSeconds(ic NetworkIngestConfig) int {
 	return ic.RDNSCacheTTLSeconds
 }
 
+// clonePayloadForAlert returns a shallow copy of the network-ingest
+// attack payload safe to embed in an alert that will be written to a
+// different Storage. Without this, the alert-storage writer races the
+// meta-storage writer that's mutating the original (adding _seq, _prev,
+// _hash) and verify reports the alert's chain hash mismatch. Shallow
+// is enough — the payload's values are scalars or already-frozen
+// slices/maps from the attackPattern struct.
+func clonePayloadForAlert(p map[string]any) map[string]any {
+	out := make(map[string]any, len(p))
+	for k, v := range p {
+		out[k] = v
+	}
+	return out
+}
+
+
 func hasNonLoopbackBind(addr string) bool {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
@@ -469,13 +485,22 @@ func (st *networkIngestState) emitValidationStatus(
 		if st.logger != nil {
 			st.logger.Write("meta", payload)
 		}
+		// Snapshot payload BEFORE the meta writer's queue picks it up —
+		// once enqueued, the meta-storage writer goroutine will mutate
+		// payload (add _seq/_prev/_hash). Embedding the live map in the
+		// alert map causes a write race: the alert-storage writer
+		// marshals alert (with payload as a nested ref) concurrently
+		// with the meta writer mutating payload, producing a hash
+		// computed over a transient state but a stored line with the
+		// final state — verify then reports a chain mismatch.
+		payloadSnap := clonePayloadForAlert(payload)
 		alert := map[string]any{
 			"event":         "rule_match",
 			"rule":          "network_ingest_attack_detected",
 			"severity":      "high",
 			"host":          ip,
-			"matched_event": payload,
-			"original":      payload,
+			"matched_event": payloadSnap,
+			"original":      payloadSnap,
 			"tactic":        first.Tactic,
 			"technique":     first.Technique,
 		}
@@ -526,13 +551,19 @@ func (st *networkIngestState) emitValidationStatus(
 		// High-severity unauth reasons go through the alert pipeline so
 		// webhooks / syslog-forwarders / incidents see them too.
 		if st.alertSink != nil && (severity == "high" || severity == "critical") {
+			// Same race-avoidance contract as the attack-detected path
+			// above: snapshot payload before embedding it in the alert,
+			// because the meta-storage writer goroutine will mutate the
+			// original (adding _seq/_prev/_hash) concurrently with any
+			// alert sink that marshals alert.
+			payloadSnap := clonePayloadForAlert(payload)
 			alert := map[string]any{
 				"event":         "rule_match",
 				"rule":          "network_ingest_unauthenticated",
 				"severity":      severity,
 				"host":          ip,
-				"matched_event": payload,
-				"original":      payload,
+				"matched_event": payloadSnap,
+				"original":      payloadSnap,
 			}
 			st.alertSink(alert)
 		}
@@ -558,43 +589,6 @@ func transportName(viaTLS bool) string {
 	return "syslog_udp_or_tcp"
 }
 
-// emitReject is retained for compatibility but no longer called by
-// the main path — handleFrame stores frames in the quarantine bucket
-// instead of rejecting them. Left here so external packages that
-// reference it (none in-tree right now) keep building.
-func (st *networkIngestState) emitReject(reason, ip, mac string, entry *networkSource, severity string) {
-	st.recordDrop(reason, ip)
-	if st.logger == nil {
-		return
-	}
-	payload := map[string]any{
-		"event":     "network_ingest_rejected",
-		"reason":    reason,
-		"source_ip": ip,
-		"source_mac": mac,
-		"severity":  severity,
-	}
-	if entry != nil {
-		payload["allowlisted_mac"] = entry.MAC
-		payload["vendor"] = entry.Vendor
-		payload["label"] = entry.Label
-	}
-	st.logger.Write("meta", payload)
-	// Push the same payload as an alert through the existing alert
-	// pipeline so webhook/syslog/incidents see it.
-	if st.alertSink != nil && (severity == "high" || severity == "critical") {
-		alert := map[string]any{
-			"event":     "rule_match",
-			"rule":      "network_ingest_rejected",
-			"severity":  severity,
-			"host":      ip,
-			"matched_event": payload,
-			"original":  payload,
-		}
-		st.alertSink(alert)
-	}
-}
-
 func (st *networkIngestState) evaluateRules(host string, fields map[string]any) {
 	rules := st.rules()
 	if len(rules) == 0 {
@@ -607,13 +601,18 @@ func (st *networkIngestState) evaluateRules(host string, fields map[string]any) 
 		if st.alertSink == nil {
 			continue
 		}
+		// fields was just enqueued to a per-label storage (line 492 /
+		// 500); its writer goroutine will mutate the map (adding
+		// _seq/_prev/_hash). Snapshot before embedding so an alert
+		// sink that marshals alert doesn't race that mutation.
+		fieldsSnap := clonePayloadForAlert(fields)
 		alert := map[string]any{
 			"event":         "rule_match",
 			"rule":          r.Name,
 			"severity":      r.Severity,
 			"host":          host,
-			"matched_event": fields,
-			"original":      fields,
+			"matched_event": fieldsSnap,
+			"original":      fieldsSnap,
 		}
 		st.alertSink(alert)
 	}
@@ -805,7 +804,7 @@ func loadOrCreateSelfSignedNetworkIngestCert(cfg Config) (tls.Certificate, strin
 	tpl := x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: "simplesiem-network-ingest"},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().Add(10 * 365 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},

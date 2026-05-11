@@ -15,16 +15,34 @@ import (
 // AuthLogCollector on Windows reads the Security event log via the
 // built-in `wevtutil.exe qe Security` subprocess. Polls every
 // auth_log_interval seconds for events with RecordId greater than
-// the last one we've seen, filters to the four logon-relevant
+// the last one we've seen, filters to the logon + account-management
 // EventIDs, and emits each one to the auth log type with a shape
 // matching the Linux/macOS auth events.
 //
-// EventIDs:
+// Logon-relevant EventIDs:
 //
 //	4624 — successful logon
 //	4625 — failed logon
 //	4634 — logoff
 //	4672 — special privileges assigned (admin login signal)
+//
+// Account-management EventIDs (canonical names match the Linux
+// authlog parser so a rule written for Linux works unchanged on
+// Windows — the s2 manual-test fix):
+//
+//	4720 — user_added                (a user account was created)
+//	4722 — user_enabled              (a user account was enabled)
+//	4724 — password_changed          (password reset attempt)
+//	4725 — user_disabled             (a user account was disabled)
+//	4726 — user_deleted              (a user account was deleted)
+//	4738 — user_modified             (a user account was changed)
+//	4781 — user_renamed              (the name of an account was changed)
+//	4732 — user_added_to_group       (member added to local group)
+//	4733 — user_removed_from_group   (member removed from local group)
+//	4727 — group_added               (security-enabled global group created)
+//	4730 — group_deleted             (security-enabled global group deleted)
+//	4731 — local_group_added         (security-enabled local group created)
+//	4734 — local_group_deleted       (security-enabled local group deleted)
 //
 // Why wevtutil instead of a native EvtSubscribe call: wevtutil ships
 // with every Windows version since Vista, doesn't need a DLL load,
@@ -136,7 +154,12 @@ func (c *AuthLogCollector) pollOnce(sinceID uint64) (uint64, error) {
 	// flood a single pollOnce. /rd:false (chronological) so we emit
 	// oldest-first.
 	xpath := fmt.Sprintf(
-		`*[System[(EventID=4624 or EventID=4625 or EventID=4634 or EventID=4672) and (EventRecordID>%d)]]`,
+		`*[System[(EventID=4624 or EventID=4625 or EventID=4634 or EventID=4672`+
+			` or EventID=4720 or EventID=4722 or EventID=4724 or EventID=4725`+
+			` or EventID=4726 or EventID=4738 or EventID=4781`+
+			` or EventID=4732 or EventID=4733`+
+			` or EventID=4727 or EventID=4730 or EventID=4731 or EventID=4734)`+
+			` and (EventRecordID>%d)]]`,
 		sinceID)
 	cmd := exec.Command("wevtutil.exe", "qe", "Security",
 		"/q:"+xpath,
@@ -148,15 +171,8 @@ func (c *AuthLogCollector) pollOnce(sinceID uint64) (uint64, error) {
 		return sinceID, fmt.Errorf("wevtutil: %w", err)
 	}
 	maxSeen := sinceID
-	// wevtutil returns one <Event>...</Event> per line for /f:RenderedXml.
-	// We parse them one at a time so a single malformed entry doesn't
-	// kill the whole batch.
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		ev, recID, ok := parseWindowsAuthEvent(line)
+	for _, blob := range splitWevtutilEvents(string(out)) {
+		ev, recID, ok := parseWindowsAuthEvent(blob)
 		if !ok {
 			continue
 		}
@@ -168,6 +184,31 @@ func (c *AuthLogCollector) pollOnce(sinceID uint64) (uint64, error) {
 	return maxSeen, nil
 }
 
+// splitWevtutilEvents extracts complete <Event>...</Event> blobs from
+// the wevtutil /f:RenderedXml byte stream. wevtutil mostly emits one
+// Event per line, but some EventData fields (notably 4720's
+// UserAccountControl) contain embedded newlines, which would split
+// a single Event across multiple lines under a naive `strings.Split`.
+// Scanning for the explicit `</Event>` close tag keeps each event
+// intact regardless of internal whitespace.
+func splitWevtutilEvents(raw string) []string {
+	var out []string
+	rest := raw
+	for {
+		startIdx := strings.Index(rest, "<Event")
+		if startIdx < 0 {
+			return out
+		}
+		endIdx := strings.Index(rest[startIdx:], "</Event>")
+		if endIdx < 0 {
+			return out
+		}
+		end := startIdx + endIdx + len("</Event>")
+		out = append(out, rest[startIdx:end])
+		rest = rest[end:]
+	}
+}
+
 // wevtMostRecentID returns the RecordId of the newest Security
 // event, used to seed the watermark on first daemon startup.
 func wevtMostRecentID() (uint64, error) {
@@ -177,12 +218,8 @@ func wevtMostRecentID() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		_, recID, ok := parseWindowsAuthEvent(line)
+	for _, blob := range splitWevtutilEvents(string(out)) {
+		_, recID, ok := parseWindowsAuthEvent(blob)
 		if ok {
 			return recID, nil
 		}
@@ -222,11 +259,14 @@ func parseWindowsAuthEvent(rawXML string) (map[string]any, uint64, bool) {
 	if err := xml.Unmarshal([]byte(rawXML), &doc); err != nil {
 		return nil, 0, false
 	}
-	// Map the four EventIDs to canonical event names that match
-	// the Linux auth-log shape. Normalising the name here means
-	// rules written for the Linux schema work unchanged on Windows.
+	// Map each EventID to a canonical event name that matches the
+	// Linux/macOS auth-log shape. Normalising the name here means
+	// rules written for the Linux schema work unchanged on Windows
+	// AND triage's eventSummary cases (added in the s2 fix) light
+	// up uniformly across platforms.
 	var eventName string
 	switch doc.System.EventID {
+	// Logon lifecycle
 	case 4624:
 		eventName = "auth_success"
 	case 4625:
@@ -235,6 +275,31 @@ func parseWindowsAuthEvent(rawXML string) (map[string]any, uint64, bool) {
 		eventName = "auth_logout"
 	case 4672:
 		eventName = "auth_admin_assigned"
+	// Account lifecycle (matches the Linux event-name vocabulary
+	// from authlog_linux.go so triage's eventSummary cases render
+	// `user_added alice uid=... ...` on Windows too).
+	case 4720:
+		eventName = "user_added"
+	case 4722:
+		eventName = "user_enabled"
+	case 4724:
+		eventName = "password_changed"
+	case 4725:
+		eventName = "user_disabled"
+	case 4726:
+		eventName = "user_deleted"
+	case 4738:
+		eventName = "user_modified"
+	case 4781:
+		eventName = "user_renamed"
+	case 4732:
+		eventName = "user_added_to_group"
+	case 4733:
+		eventName = "user_removed_from_group"
+	case 4727, 4731:
+		eventName = "group_added"
+	case 4730, 4734:
+		eventName = "group_deleted"
 	default:
 		return nil, doc.System.EventRecordID, false
 	}
@@ -247,17 +312,52 @@ func parseWindowsAuthEvent(rawXML string) (map[string]any, uint64, bool) {
 		data[strings.ToLower(d.Name)] = strings.TrimSpace(d.Val)
 	}
 	out := map[string]any{
-		"event":         eventName,
-		"event_id":      doc.System.EventID,
-		"record_id":     doc.System.EventRecordID,
-		"computer":      doc.System.Computer,
-		"provider":      doc.System.Provider.Name,
-		"user":          firstNonEmpty(data["targetusername"], data["subjectusername"]),
-		"domain":        firstNonEmpty(data["targetdomainname"], data["subjectdomainname"]),
-		"logon_type":    data["logontype"],
-		"source_ip":     data["ipaddress"],
-		"workstation":   data["workstationname"],
+		"event":          eventName,
+		"event_id":       doc.System.EventID,
+		"record_id":      doc.System.EventRecordID,
+		"computer":       doc.System.Computer,
+		"provider":       doc.System.Provider.Name,
+		"user":           firstNonEmpty(data["targetusername"], data["subjectusername"]),
+		"domain":         firstNonEmpty(data["targetdomainname"], data["subjectdomainname"]),
+		"logon_type":     data["logontype"],
+		"source_ip":      data["ipaddress"],
+		"workstation":    data["workstationname"],
 		"failure_reason": data["failurereason"],
+	}
+	// Account-management events carry the actor on SubjectUserName
+	// (the admin who ran the change) and the target on
+	// TargetUserName/MemberName. Surface both — the Linux parser
+	// only knows the target, but Windows audit gives us the actor
+	// for free, so we keep it as `actor` for richer triage rows.
+	switch doc.System.EventID {
+	case 4720, 4722, 4724, 4725, 4726, 4738, 4781:
+		// User-account events: target is the user being changed.
+		if v := data["targetusername"]; v != "" {
+			out["user"] = v
+		}
+		if v := data["subjectusername"]; v != "" {
+			out["actor"] = v
+		}
+	case 4732, 4733:
+		// Group-membership: TargetUserName is the GROUP, MemberName
+		// (or MemberSid resolved out-of-band) is the user being
+		// added/removed. Map onto the Linux schema so eventSummary's
+		// `user_added_to_group` case renders correctly.
+		out["group"] = data["targetusername"]
+		if mn := data["membername"]; mn != "" {
+			out["user"] = mn
+		} else if ms := data["membersid"]; ms != "" {
+			out["user"] = ms
+		}
+		if v := data["subjectusername"]; v != "" {
+			out["actor"] = v
+		}
+	case 4727, 4730, 4731, 4734:
+		// Group lifecycle: TargetUserName carries the group name.
+		out["group"] = data["targetusername"]
+		if v := data["subjectusername"]; v != "" {
+			out["actor"] = v
+		}
 	}
 	if ts := doc.System.TimeCreated.SystemTime; ts != "" {
 		// SystemTime is ISO-8601 with high-precision fraction; pass

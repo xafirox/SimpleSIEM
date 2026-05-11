@@ -81,7 +81,7 @@ func newEnrollHarness(t *testing.T) *enrollHarness {
 		configPath:        cfgPath,
 		enrollClientYears: 5,
 		enrollLimiter:     newRateLimiter(100, 100),
-		reauthSeconds:     60,
+		reauthSeconds:     15,
 		storages:          map[string]*Storage{},
 	}
 
@@ -173,8 +173,8 @@ func TestEnroll_HappyPath(t *testing.T) {
 	if er.CertPem == "" || er.CAPem == "" || er.Hmac == "" {
 		t.Fatal("response missing fields")
 	}
-	if er.ReauthSeconds != 60 {
-		t.Errorf("reauth_seconds=%d, want 60", er.ReauthSeconds)
+	if er.ReauthSeconds != 15 {
+		t.Errorf("reauth_seconds=%d, want 15", er.ReauthSeconds)
 	}
 	if !er.NewlyAdded {
 		t.Error("first enrollment should be NewlyAdded=true")

@@ -1,6 +1,7 @@
 package sieg
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -188,20 +189,33 @@ func printTriageMulti(roots []searchRoot, pivot Event, window time.Duration, typ
 // emitTriageJSONMulti is the JSON-output counterpart to printTriageMulti.
 // Each emitted line is the original event JSON augmented with _delta_ms,
 // _pivot, and (when set) the "host" field.
-func emitTriageJSONMulti(roots []searchRoot, pivot Event, window time.Duration, typeFilter string) {
+func emitTriageJSONMulti(roots []searchRoot, pivot Event, window time.Duration, typeFilter string, pretty bool, selectFields, getPath string) {
 	start := pivot.TS.Add(-window)
 	end := pivot.TS.Add(window)
 	events := loadEventsInRangeMulti(roots, start, end, typeFilter)
-	enc := json.NewEncoder(os.Stdout)
+	bw := bufio.NewWriter(os.Stdout)
+	defer bw.Flush()
 	for _, e := range events {
-		out := make(map[string]any, len(e.Data)+2)
+		// Pivot-mode adds two synthetic fields (_delta_ms +
+		// _pivot). We rebuild the JSON line WITH those, then hand
+		// off to emitJSONLine so --pretty / --select / --get all
+		// apply uniformly. Without this rebuild --get .field on a
+		// pivot row would silently miss the _delta_ms enrichment.
+		obj := make(map[string]any, len(e.Data)+2)
 		for k, v := range e.Data {
-			out[k] = v
+			if k == "_hash" || k == "_prev" || k == "_seq" {
+				continue
+			}
+			obj[k] = v
 		}
-		out["_delta_ms"] = e.TS.Sub(pivot.TS).Milliseconds()
+		obj["_delta_ms"] = e.TS.Sub(pivot.TS).Milliseconds()
 		if pivot.Raw != "" && e.Raw == pivot.Raw {
-			out["_pivot"] = true
+			obj["_pivot"] = true
 		}
-		_ = enc.Encode(out)
+		buf, err := json.Marshal(obj)
+		if err != nil {
+			continue
+		}
+		emitJSONLine(bw, buf, true /*withChain — we already stripped above*/, pretty, selectFields, getPath)
 	}
 }

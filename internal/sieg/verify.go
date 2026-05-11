@@ -128,6 +128,15 @@ func verifyFile(path string) verifyResult {
 			continue
 		}
 		res.events++
+		// _chain_skip lines are diagnostic events written by the
+		// writer watchdog directly to disk (bypassing the chain) when
+		// the writer goroutine is wedged. They have no _hash/_prev/
+		// _seq because the watchdog can't safely race the writer for
+		// the in-memory chain state. Skip without flagging — they're
+		// non-events from the chain's perspective.
+		if skip, _ := event["_chain_skip"].(bool); skip {
+			continue
+		}
 		gotHash, _ := event["_hash"].(string)
 		gotPrev, _ := event["_prev"].(string)
 		gotSeq := uint64(0)

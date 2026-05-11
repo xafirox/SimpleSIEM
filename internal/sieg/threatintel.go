@@ -42,6 +42,13 @@ type ThreatIntelFeedSpec struct {
 	MinConfidence  int      `json:"min_confidence"`
 	MaxAgeDays     int      `json:"max_age_days"`
 	IndicatorKinds []string `json:"indicator_kinds"`
+	// AuthKey is the per-feed API key surfaced as the `Auth-Key`
+	// HTTP header by feed kinds that require it. abuse.ch (every
+	// kind under abuse.ch.*) now mandates an Auth-Key for any
+	// query — the default ThreatFox feed cannot fetch indicators
+	// until an operator runs `simplesiem threatintel feed set <id>
+	// auth-key <key>` (free key from https://auth.abuse.ch/).
+	AuthKey string `json:"auth_key"`
 }
 
 func defaultThreatIntelConfig() ThreatIntelConfig {
@@ -142,21 +149,45 @@ func (m *threatIntelManager) Start(ctx context.Context, wg *sync.WaitGroup) {
 
 func (m *threatIntelManager) fetchAll(ctx context.Context) {
 	for _, f := range m.cfg.Feeds {
-		if m.shouldFetch(f) {
-			if err := m.fetchOne(ctx, f); err != nil {
-				if !m.failedOnce.Load() && m.logger != nil {
-					m.logger.Write("meta", map[string]any{
-						"event": "threatintel_fetch_failed",
-						"feed":  f.Name,
-						"error": err.Error(),
-						"hint":  "reusing cached indicator set; rules continue to match against last successful fetch",
-					})
-					m.failedOnce.Store(true)
-				}
-				continue
-			}
-			m.failedOnce.Store(false)
+		if !m.shouldFetch(f) {
+			continue
 		}
+		if err := m.fetchOne(ctx, f); err != nil {
+			// Surface every failure (not just the first) so operators
+			// can see when transient errors clear up vs. persist.
+			// Hint includes a concrete next-step the operator can run.
+			if m.logger != nil {
+				m.logger.Write("meta", map[string]any{
+					"event": "threatintel_fetch_failed",
+					"feed":  f.Name,
+					"url":   f.URL,
+					"error": err.Error(),
+					"hint":  "reusing cached indicator set; rules still match against the last successful fetch. Retry with `simplesiem threatintel fetch` after fixing the underlying issue (network, URL, auth-key, etc.).",
+				})
+			}
+			m.failedOnce.Store(true)
+			continue
+		}
+		// Surface success too — operators previously had no way to
+		// tell whether the daemon's auto-pull was working without
+		// inspecting the cache directory by hand.
+		if m.logger != nil {
+			m.mu.RLock()
+			set := m.sets[f.Name]
+			m.mu.RUnlock()
+			indicators := 0
+			if set != nil {
+				for _, bucket := range set.Entries {
+					indicators += len(bucket)
+				}
+			}
+			m.logger.Write("meta", map[string]any{
+				"event":      "threatintel_fetch_ok",
+				"feed":       f.Name,
+				"indicators": indicators,
+			})
+		}
+		m.failedOnce.Store(false)
 	}
 }
 
@@ -184,12 +215,16 @@ func (m *threatIntelManager) fetchOne(ctx context.Context, f ThreatIntelFeedSpec
 }
 
 func (m *threatIntelManager) fetchThreatFox(ctx context.Context, f ThreatIntelFeedSpec) error {
+	if f.AuthKey == "" {
+		return fmt.Errorf("abuse.ch ThreatFox now requires an Auth-Key. Get a free key at https://auth.abuse.ch/, then run: simplesiem threatintel feed set %s auth-key <key>", f.Name)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.URL,
 		strings.NewReader(`{"query":"get_iocs","days":1}`))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Auth-Key", f.AuthKey)
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -198,7 +233,11 @@ func (m *threatIntelManager) fetchThreatFox(ctx context.Context, f ThreatIntelFe
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		hint := ""
+		if resp.StatusCode == http.StatusUnauthorized {
+			hint = " (verify the auth-key at https://auth.abuse.ch/)"
+		}
+		return fmt.Errorf("HTTP %d%s: %s", resp.StatusCode, hint, strings.TrimSpace(string(body)))
 	}
 	var doc struct {
 		QueryStatus string `json:"query_status"`

@@ -62,7 +62,14 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 	}
 	reauth := cfg.Server.AgentReauthSeconds
 	if reauth <= 0 {
-		reauth = 60
+		// 15s default. Heartbeats are tiny (mTLS handshake + ~200B JSON);
+		// 4 per minute per agent is well within budget. Tighter defaults
+		// matter because the heartbeat is the propagation channel for
+		// realm.peers changes back to already-enrolled agents — at the
+		// previous 60s default, MAMS-1 manifested where agents enrolled
+		// before a peer joined the realm could spend up to a full minute
+		// with stale agent.failover_servers.
+		reauth = 15
 	}
 	// Best-effort PSK load. Failure here doesn't break the server (the
 	// PSK only matters when /v1/enroll is hit); but log it so the
@@ -243,6 +250,18 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 	st.volumeAnomaly.onRecovered = st.writeRecovered
 	st.volumeAnomaly.start(ctx, wg)
 
+	// Absolute-silence detector (complementary to volumeAnomaly):
+	// fires meta:agent_silent_anomaly for an allowlisted agent that
+	// hasn't ingressed/heartbeated for >5 min, regardless of whether
+	// it ever built up a baseline. Catches the as7 scenario — agent
+	// enrolled, then killed before chatting — that the EWMA-based
+	// detector can't see because there's no baseline to drop from.
+	silenceThreshold := 5 * time.Minute
+	if v := cfg.Server.VolumeAnomaly.SilenceMins; v > 0 {
+		silenceThreshold = time.Duration(v) * time.Minute
+	}
+	newAgentSilenceDetector(st, silenceThreshold).start(ctx, wg)
+
 	// Alert webhooks — operator-configured POST targets that
 	// receive every fired alert as JSON. Returns nil when no
 	// webhooks are configured; subsequent SetAlertHook calls
@@ -351,6 +370,26 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 		startPendingJoinWatcher(ctx, cfgPath, mst)
 	} else {
 		startPendingJoinWatcher(ctx, cfgPath, nil)
+	}
+
+	// Rules hot-reload watcher: rules enable / disable / etc. write
+	// rules.json; without this watcher the running daemon's in-memory
+	// rule set stays stale until the next restart, so a freshly-enabled
+	// rule never fires alerts. Mirrors the master-push fan-out so both
+	// the central state and each per-host Storage pick up the new set.
+	if cfg.RulesPath != "" {
+		var rwLogger *Storage
+		if mst, err := st.storageFor("_server"); err == nil {
+			rwLogger = mst
+		}
+		startRulesWatcher(ctx, wg, cfg.RulesPath, func(rules []*alertRule) {
+			st.setRules(rules)
+			st.mu.Lock()
+			for _, hostStore := range st.storages {
+				hostStore.SetRules(rules)
+			}
+			st.mu.Unlock()
+		}, rwLogger)
 	}
 
 	// Cert expiry monitor — daily check of server.pem, ca.pem, and
@@ -603,6 +642,14 @@ type serverState struct {
 	// todBaseline keeps per-entity hour-of-day histograms and
 	// emits unusual_time_anomaly events. See todbaseline.go.
 	todBaseline *todBaselineDetector
+
+	// hostLastSeen records the last-heard time per agent CN. Bumped
+	// on every authorised heartbeat or events POST so the hosts list
+	// in `simplesiem status` can show CONFIRMED LIVE agents instead
+	// of every directory under log_dir (the latter includes long-
+	// uninstalled hosts whose log dir is still around for retention).
+	hostLivenessMu sync.RWMutex
+	hostLastSeen   map[string]time.Time
 }
 
 // agentAllowedTypes is the set of log types an agent can write to.
@@ -959,6 +1006,18 @@ func (s *serverState) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agent revoked", http.StatusForbidden)
 		return
 	}
+
+	// Liveness: an authorised events POST counts as the agent being
+	// live. The hosts-list filter (`recentlyActiveHosts`) reads this
+	// map so `simplesiem status` only shows agents we've actually
+	// heard from inside the freshness window — not every directory
+	// under log_dir, which would include long-uninstalled hosts.
+	s.hostLivenessMu.Lock()
+	if s.hostLastSeen == nil {
+		s.hostLastSeen = map[string]time.Time{}
+	}
+	s.hostLastSeen[host] = time.Now().UTC()
+	s.hostLivenessMu.Unlock()
 
 	// Bound the body. A 32 MiB cap on the gzip-compressed payload lets a
 	// well-behaved agent send ~10× that much NDJSON before being asked to

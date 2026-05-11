@@ -144,7 +144,13 @@ func installService(args []string) {
 		fmt.Printf("  slot state:    %s\n", collectorPreflight.SlotState)
 	}
 
-	for _, d := range []string{*binDir, *cfgDir, *logDir} {
+	// Including defaultStateDir() ahead of writeSystemd is critical:
+	// the unit's `ReadWritePaths=` includes /var/lib/simplesiem, and
+	// systemd's mount-namespace setup fails with status=226/NAMESPACE
+	// when any listed path is missing. State data is normally written
+	// lazily at runtime (PSK, chainhead key, first-seen state) but the
+	// directory itself MUST exist before systemd starts the unit.
+	for _, d := range []string{*binDir, *cfgDir, *logDir, defaultStateDir()} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			fatalf("mkdir %s: %v", d, err)
 		}
@@ -159,8 +165,17 @@ func installService(args []string) {
 		// and webhook URLs; group/world read isn't appropriate.
 		// atomicWriteFile keeps a partial write from being visible
 		// if the daemon is racing the installer.
-		if err := atomicWriteFile(cfgFile, []byte(configJSONForMode(*mode)), 0o600); err != nil {
+		data := []byte(configJSONForMode(*mode))
+		if err := atomicWriteFile(cfgFile, data, 0o600); err != nil {
 			fatalf("write config: %v", err)
+		}
+		// Seed config.json.bak with the same default so the
+		// "fall back to .bak after a malformed manual edit"
+		// recovery path always has a valid file to roll back to,
+		// even on a freshly-installed system that hasn't been
+		// modified yet (the s10 manual-test failure mode).
+		if err := os.WriteFile(cfgFile+".bak", data, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not seed %s.bak: %v\n", cfgFile, err)
 		}
 		fmt.Println("wrote default config:", cfgFile, "(mode:", *mode+")")
 	}
@@ -181,6 +196,14 @@ func installService(args []string) {
 	// to defer setup) skip this and the unit gets installed without
 	// starting, same as before.
 	if *mode == "server" {
+		// Set mode explicitly: when install runs over an existing config
+		// (e.g. uninstall -y left a standalone-default cfg behind), the
+		// file-exists guard skipped the configJSONForMode write, so
+		// cfg.Mode stays "standalone" without this assignment.
+		if cfg, err := loadConfigStrict(cfgFile); err == nil {
+			cfg.Mode = "server"
+			_ = saveConfig(cfgFile, cfg)
+		}
 		if _, lines, err := ensureServerPKI(cfgFile, 10, 5); err != nil {
 			fatalf("server setup: %v", err)
 		} else {
@@ -236,9 +259,13 @@ func installService(args []string) {
 		if err != nil {
 			fatalf("enrollment failed: %v", err)
 		}
-		// Persist server_url + (optionally) ID + realm peer list into
-		// the freshly-written config so the daemon reads them on start.
+		// Persist mode + server_url + (optionally) ID + realm peer list
+		// into the freshly-written config so the daemon reads them on
+		// start. Mode is set explicitly because the file-exists guard
+		// above skips the configJSONForMode write when install runs
+		// over an existing standalone config (e.g. after `uninstall -y`).
 		cfg, _ := loadConfigStrict(cfgFile)
+		cfg.Mode = "agent"
 		cfg.Agent.ServerURL = *serverURL
 		if *agentID != "" {
 			cfg.Agent.ID = *agentID
@@ -284,11 +311,30 @@ func installService(args []string) {
 	fmt.Printf("  binary: %s\n  config: %s\n  logs:   %s\n", destBin, cfgFile, *logDir)
 	if runtime.GOOS == "linux" && !hasSystemd() {
 		fmt.Println("  service: standalone fork (systemd not detected)")
+		// Standalone-fork mode has no auto-restart on host/container
+		// reboot — the forked daemon dies with PID 1 and there's
+		// nothing to respawn it. Surface this BEFORE the operator
+		// hits the "why isn't simplesiem running after I restarted
+		// the container?" failure mode.
+		fmt.Println()
+		fmt.Println(strings.Repeat("=", 72))
+		fmt.Println("  IMPORTANT: standalone-fork mode does NOT auto-start at boot.")
+		fmt.Println(strings.Repeat("=", 72))
+		fmt.Println("  This host has no systemd; the daemon was forked just now but")
+		fmt.Println("  WILL NOT come back up after a reboot or container restart.")
 		if isContainer() {
 			fmt.Println()
-			fmt.Println("tip: in a Docker image, skip install and use this as the ENTRYPOINT:")
-			fmt.Printf("       CMD [\"%s\", \"run\"]\n", destBin)
+			fmt.Println("  Recommended for Docker: use simplesiem as the container's")
+			fmt.Println("  ENTRYPOINT/CMD with --supervise so the daemon both auto-starts")
+			fmt.Println("  on container start AND respawns on crash:")
+			fmt.Printf("       CMD [\"%s\", \"run\", \"--supervise\", \"--config\", \"%s\"]\n", destBin, cfgFile)
+		} else {
+			fmt.Println()
+			fmt.Println("  Recommended for non-systemd Linux: add a respawning entry to")
+			fmt.Println("  your init system pointing at:")
+			fmt.Printf("       %s run --supervise --config %s\n", destBin, cfgFile)
 		}
+		fmt.Println()
 	}
 }
 
@@ -619,6 +665,13 @@ func startCommand(args []string) {
 	// point in handing the start command to the OS service manager
 	// when we can already see the configuration is incomplete.
 	if err := preflightStart(cfgFile); err != nil {
+		// Malformed-config errors get the loud banner; cert/url
+		// problems keep the single-line preflight message they
+		// already had.
+		if _, ok := err.(*configParseError); ok {
+			reportStartupError(err)
+			os.Exit(1)
+		}
 		fatalf("preflight: %v", err)
 	}
 	switch runtime.GOOS {
@@ -644,6 +697,11 @@ func startCommand(args []string) {
 
 func stopCommand(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	// Accept -y as a no-op so callers who treat it as "yes,
+	// non-interactive" don't trip flag.ExitOnError. There's no
+	// confirmation prompt here, so the flag is purely for ergonomic
+	// consistency with `uninstall -y`, `migrate -y`, etc.
+	_ = fs.Bool("y", false, "skip confirmation (no-op; stop is non-interactive)")
 	_ = fs.Parse(args)
 	if os.Geteuid() != 0 {
 		fatalf("must run as root (use sudo)")
@@ -693,12 +751,47 @@ func uninstallService(_ []string) {
 //   - PrivateTmp is NOT enabled because FileCollector watches /tmp by
 //     default; PrivateTmp would give the daemon its own namespaced /tmp
 //     and silently miss real /tmp activity.
-//   - ProtectHome=read-only (not =true) because /home is in the default
-//     watch list — fsnotify only needs read access.
+//   - ProtectHome is intentionally NOT set: operators can configure
+//     log_dir to anywhere realistic (e.g. /home/<user>/tmp on lab hosts,
+//     /opt/siem-logs on appliances) and the daemon must be able to write
+//     there without the operator re-running `simplesiem install` or hand-
+//     editing the unit file. ProtectSystem=full still locks /etc, /usr,
+//     /boot, /efi; the writable carve-outs in ReadWritePaths preserve
+//     /etc/simplesiem for config edits and the chainhead key. The daemon
+//     runs as root regardless, so ProtectHome=read-only never bounded
+//     attacker capability — it only forced an extra `install` step on
+//     legitimate log_dir changes.
 //   - RestrictAddressFamilies includes AF_NETLINK because gopsutil reads
 //     connection state via netlink on Linux.
 //   - SystemCallFilter blocks @clock @cpu-emulation @debug @module @mount
 //     @obsolete @raw-io @reboot @swap by listing only the allow groups.
+// systemdTpl is the systemd unit installed at
+// /etc/systemd/system/simplesiem.service. The hardening profile is
+// scoped for "SIEM that intentionally observes every process on the
+// host" — DIFFERENT from a generic web service. Specifically:
+//
+//   - ProtectProc is intentionally NOT set to "invisible" — that
+//     would hide every other-user process from /proc/, which kills
+//     the whole point of ProcessCollector. SIEMs need broad /proc
+//     visibility.
+//   - MemoryDenyWriteExecute is OFF. The Go runtime occasionally
+//     allocates PROT_WRITE|PROT_EXEC pages on newer kernels for
+//     defer/panic trampolines, and the resulting SIGSYS kill is
+//     silent — the daemon dies with "no logs" before it can write
+//     anything to /var/log/simplesiem. The other process-isolation
+//     flags below already bound what a compromised daemon can do.
+//   - SystemCallFilter is a DENY-LIST of dangerous syscall classes,
+//     not an allow-list. Allow-listing breaks too easily when Go's
+//     runtime adds a syscall in a future version (e.g. clone3, the
+//     io_uring family). The deny-list catches root-equivalent
+//     escapes (mount, module load, kernel reboot, raw I/O) without
+//     guessing every legitimate syscall a Go binary needs.
+//   - ReadWritePaths carves out /var/log/simplesiem (default log_dir),
+//     /var/lib/simplesiem (state), /etc/simplesiem (config), and /run.
+//     extraReadWritePaths() appends the operator-configured log_dir
+//     and any storage failover locations at unit-write time so the
+//     happy path also works for non-default log_dir values that fall
+//     under ProtectSystem=full's locked subtrees.
 const systemdTpl = `[Unit]
 Description=SimpleSIEM on-box SIEM
 After=network.target
@@ -711,30 +804,59 @@ RestartSec=5
 User=root
 NoNewPrivileges=true
 ProtectSystem=full
-ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
-ProtectProc=invisible
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RestrictNamespaces=true
-MemoryDenyWriteExecute=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 SystemCallArchitectures=native
-SystemCallFilter=@system-service @network-io @file-system
-SystemCallFilter=~@privileged @resources
+SystemCallFilter=~@cpu-emulation @debug @keyring @memlock @module @mount @obsolete @raw-io @reboot @swap
+ReadWritePaths=-/var/log/simplesiem -/var/lib/simplesiem -/etc/simplesiem -/run %s
 
 [Install]
 WantedBy=multi-user.target
 `
 
+// extraReadWritePaths returns the configured log_dir (and any other
+// operator-chosen writable directory) as additional ReadWritePaths
+// entries for the systemd unit. The defaults are baked into systemdTpl;
+// this function adds whatever log_dir is currently set so a non-default
+// log_dir doesn't get sandbox-blocked. Each path is prefixed with `-`
+// so a missing dir during unit generation doesn't break the namespace.
+func extraReadWritePaths(cfgFile string) string {
+	c := loadConfig(cfgFile)
+	seen := map[string]bool{
+		"/var/log/simplesiem":  true,
+		"/var/lib/simplesiem":  true,
+		"/etc/simplesiem":      true,
+		"/run":                 true,
+	}
+	var extras []string
+	add := func(p string) {
+		p = strings.TrimRight(strings.TrimSpace(p), "/")
+		if p == "" || seen[p] {
+			return
+		}
+		seen[p] = true
+		extras = append(extras, "-"+p)
+	}
+	add(c.LogDir)
+	// Storage failover locations also need write access if they're
+	// outside the defaults.
+	for _, fl := range c.Storage.FailoverLocations {
+		add(fl)
+	}
+	return strings.Join(extras, " ")
+}
+
 func writeSystemd(bin, cfg string, autoStart bool) error {
-	unit := fmt.Sprintf(systemdTpl, bin, cfg)
+	unit := fmt.Sprintf(systemdTpl, bin, cfg, extraReadWritePaths(cfg))
 	unitPath := "/etc/systemd/system/" + serviceName + ".service"
 	if err := os.WriteFile(unitPath, []byte(unit), 0o644); err != nil {
 		return fmt.Errorf("write unit: %w", err)

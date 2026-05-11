@@ -108,45 +108,93 @@ func agentOutageState(base string) (start, recovered time.Time, reason string, o
 }
 
 // daemonLooksWedged returns (true, "<duration>") when the daemon claims
-// to be running but the most recent write to any of the canonical meta
-// directories is older than 5 minutes. That's a strong signal of the
-// "kill -9 + restart but nothing actually came back" failure mode —
-// status used to say "running" cheerfully even when the daemon was
-// dead and only its PID file lingered. Now we cross-check against
-// fresh disk activity so the operator sees a red SILENT label instead.
+// to be running but the entire log tree has gone untouched for too
+// long. That's a strong signal of the "kill -9 + restart but nothing
+// actually came back" failure mode — status used to say "running"
+// cheerfully even when the daemon was dead and only its PID file
+// lingered.
 //
-// The 5-minute floor is generous: even an idle agent should write a
-// meta heartbeat or a process collector cycle within that window.
+// Detection walks the WHOLE log_dir tree (depth-limited) for the
+// freshest .jsonl mtime. Earlier versions checked only two specific
+// candidates (`<log_dir>/meta` and `<log_dir>/_<mode>/meta`); on a
+// busy server most writes land under per-agent host dirs and the
+// _server/meta path can lag behind the rest, which produced the
+// reported false-positive `running but SILENT (no writes for 14m33s)`
+// even though agent ingestion was actively writing per-host dirs.
+//
+// Threshold bumped to 10 minutes so a brief stall (network glitch
+// during a sync, brief disk pressure) doesn't trip the alarm. The
+// daemon writes `meta:daemon_alive` every 60 s under its primary
+// store, so 10x that is the floor we accept.
 func daemonLooksWedged(cfg Config) (bool, string) {
-	mode := normaliseMode(cfg.Mode)
-	candidates := []string{
-		filepath.Join(cfg.LogDir, "meta"),
-	}
-	switch mode {
-	case "agent":
-		candidates = append(candidates, filepath.Join(cfg.LogDir, "_agent", "meta"))
-	case "server":
-		candidates = append(candidates, filepath.Join(cfg.LogDir, "_server", "meta"))
-	}
-	today := time.Now().UTC().Format("2006-01-02")
-	mostRecent := time.Time{}
-	for _, dir := range candidates {
-		path := filepath.Join(dir, today+".jsonl")
-		if info, err := os.Stat(path); err == nil {
-			if info.ModTime().After(mostRecent) {
-				mostRecent = info.ModTime()
-			}
-		}
-	}
+	const threshold = 10 * time.Minute
+	const maxDepth = 4
+	mostRecent := freshestMtime(cfg.LogDir, maxDepth)
 	if mostRecent.IsZero() {
-		// No file at all — could be a fresh boot. Don't accuse.
 		return false, ""
 	}
 	age := time.Since(mostRecent)
-	if age > 5*time.Minute {
+	if age > threshold {
 		return true, age.Round(time.Second).String()
 	}
 	return false, ""
+}
+
+// freshestMtime walks base up to maxDepth levels deep and returns the
+// most recent ModTime across every .jsonl file it finds. Cheap on a
+// healthy install (single-digit dirs, a handful of files each); the
+// depth cap keeps it bounded on installs with deep mirror trees
+// (master pulling from servers, collector mirroring per-host events).
+//
+// Zero return means "no .jsonl files at all" — a fresh install with
+// no events yet. Callers treat that as "don't accuse" rather than
+// SILENT.
+//
+// Windows note: uses `os.Stat(path)` instead of the cheaper
+// `DirEntry.Info()` because Windows does NOT update directory-entry
+// mtime/size for files held open in O_APPEND mode by another
+// process — exactly what the daemon's writer goroutine is doing on
+// every active log type. DirEntry.Info() returns the stale value
+// from the MFT directory listing, which made `daemonLooksWedged`
+// false-fire "running but SILENT (no writes for 16m59s)" on Windows
+// boxes whose daemons were actually writing every second. os.Stat
+// opens the file via CreateFile + GetFileInformationByHandle and
+// returns the live mtime from the file pointer. Linux/macOS lstat
+// is accurate either way, so this is a Windows-only correctness
+// fix; the cost on those platforms is one extra syscall per file
+// (negligible at this scan's scale).
+func freshestMtime(base string, maxDepth int) time.Time {
+	var newest time.Time
+	var walk func(dir string, depth int)
+	walk = func(dir string, depth int) {
+		if depth < 0 {
+			return
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return
+		}
+		for _, e := range entries {
+			full := filepath.Join(dir, e.Name())
+			if e.IsDir() {
+				walk(full, depth-1)
+				continue
+			}
+			name := e.Name()
+			if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".jsonl.gz") {
+				continue
+			}
+			info, err := os.Stat(full)
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+	}
+	walk(base, maxDepth)
+	return newest
 }
 
 // lastShipperError returns the most recent agent_shipper error message
@@ -250,6 +298,20 @@ func runQuery(args []string) {
 	dedupe := fs.Bool("dedupe", false, "drop duplicate events by _hash (useful in master mode where realms replicate the same event into multiple from-<peer>.jsonl files)")
 	format := fs.String("format", "json", "output format: json (one-line-per-event NDJSON, default), csv, or tsv")
 	csvFields := fs.String("csv-fields", "", "comma-separated field list for csv/tsv output (default: ts,type,host,event)")
+	// Hash chain fields (_hash, _prev, _seq) are storage-internal — they
+	// exist so `simplesiem verify` can detect tampering, but they're
+	// noise in the operator's day-to-day query output. Stripped from
+	// JSON output by default; --with-chain shows them when an operator
+	// is debugging a chain break or piping to a verifier.
+	withChain := fs.Bool("with-chain", false, "include _hash/_prev/_seq fields in JSON output (default: stripped — use `simplesiem verify` to check the chain)")
+	// Built-in jq-equivalents. Pure Go, cross-platform — no
+	// dependency on `jq` (Linux/Mac default-installed but never on
+	// Windows). The three operate on the same JSON object before
+	// emit, in this order: --select narrows the field set,
+	// --get pulls a single dotted path, --pretty indents.
+	pretty := fs.Bool("pretty", false, "pretty-print JSON output (multi-line indented; equivalent to piping to `jq .`)")
+	selectFields := fs.String("select", "", "comma-separated field allowlist for JSON output, e.g. --select ts,event,user (equivalent to `jq '{ts,event,user}'`)")
+	getPath := fs.String("get", "", "extract one dotted path per matched event, e.g. --get .data.user (equivalent to `jq -r '.data.user'`); newline-delimited raw values")
 	_ = fs.Parse(args)
 	fields := fieldFlags.compiled()
 	var seen map[string]struct{}
@@ -435,8 +497,7 @@ func runQuery(args []string) {
 					}
 					out.WriteByte('\n')
 				} else {
-					out.Write(line)
-					out.WriteByte('\n')
+					emitJSONLine(out, line, *withChain, *pretty, *selectFields, *getPath)
 				}
 				emitted++
 				if *limit > 0 && emitted >= *limit {
@@ -504,6 +565,370 @@ func printAgentQueryHint(cfg Config, hostFilter string, emitted *int) {
 	fmt.Fprintln(os.Stderr)
 	fmt.Fprintln(os.Stderr, "Local diagnostics only (no server round-trip):")
 	fmt.Fprintln(os.Stderr, "  simplesiem query --host _agent")
+}
+
+// stickyIPHosts loads the on-disk network ingest allowlist (the
+// "sticky-IP" sources that send authenticated syslog/UDP frames) and
+// returns the host labels frames from those sources land under. Used
+// by the hosts-list filter so the operator sees BOTH mTLS agents
+// (cfg.Server.AgentAllowlist) and network-ingest sources in the same
+// status line — without this, the user kept asking "where are my
+// network sources, I configured them with `network-source add`" and
+// only seeing their mTLS agents.
+//
+// The host label per source mirrors what netingest_listener writes:
+// the syslog frame's hostname when present, or the source IP after
+// sanitisation. Without an actual frame in hand we can't know the
+// hostname, so the IP-derived dir is the most reliable freshness
+// probe target.
+func stickyIPHosts() []string {
+	data, err := os.ReadFile(networkAllowlistPath())
+	if err != nil {
+		return nil
+	}
+	var f networkAllowlistFile
+	if jerr := json.Unmarshal(data, &f); jerr != nil {
+		return nil
+	}
+	out := make([]string, 0, len(f.Entries))
+	seen := map[string]struct{}{}
+	for _, e := range f.Entries {
+		// Source IP is the canonical fallback host label when a
+		// frame doesn't carry its own hostname; sanitiseHost is
+		// what the listener applies so we mirror that here.
+		label := sanitiseHost(e.IP)
+		if label == "" {
+			continue
+		}
+		if _, ok := seen[label]; ok {
+			continue
+		}
+		seen[label] = struct{}{}
+		out = append(out, label)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// printHostsLive renders the "hosts:" status line as a list of LIVE
+// agents — those whose identity is in the configured allowlist AND
+// whose latest log file under <log_dir>/<host>/ is newer than the
+// freshness window. Stale-but-allowlisted hosts and orphan directories
+// (allowlist entry removed but data retained) are surfaced separately
+// so the operator sees them without having them counted as live.
+// Sticky-IP entries from the network ingest allowlist are appended
+// underneath as a separate `(syslog source)` block so they don't get
+// confused with mTLS agents.
+//
+// Liveness signal is mtime of the newest .jsonl(.gz) under the host's
+// directory tree. mtime is updated on every write and survives gzip
+// rotation, so it tracks "we heard from this agent" within a second
+// or two regardless of the log type. The 10-minute window is generous:
+// agents heartbeat every 60s by default, so a 10x safety factor still
+// catches a recently-stopped agent without flagging a healthy one.
+//
+// Why allowlist-driven, not directory-walk: the directory walk we
+// previously used surfaced every long-retained host dir as if it were
+// live (an agent uninstalled 28 days ago still shows for the full
+// retention period), AND in standalone mode mistook the log-type dirs
+// (network/, files/, ...) for hosts. Driving the list from the
+// allowlist makes "hosts" mean "agents the operator told this server
+// to expect," which is what every reader of `status` actually wanted.
+func printHostsLive(cfg Config) {
+	const liveWindow = 10 * time.Minute
+	allow := append([]string{}, cfg.Server.AgentAllowlist...)
+	allowSet := map[string]struct{}{}
+	for _, a := range allow {
+		allowSet[a] = struct{}{}
+	}
+	live, stale, orphan := classifyHostLiveness(cfg.LogDir, allow, allowSet, liveWindow)
+	now := time.Now()
+
+	if len(allow) == 0 {
+		// Empty allowlist = open mode. The directory walk is the only
+		// signal we have for who's connecting. Render with the freshness
+		// note so an operator doesn't read "10 hosts" as 10 LIVE hosts.
+		dirHosts := listHosts(cfg.LogDir)
+		filtered := dirHosts[:0]
+		for _, h := range dirHosts {
+			if !strings.HasPrefix(h, "_") {
+				filtered = append(filtered, h)
+			}
+		}
+		fmt.Printf("hosts:          %d (allowlist empty / open mode — directory-derived list)\n", len(filtered))
+		for _, h := range filtered {
+			ts := newestMTimeForHost(cfg.LogDir, h)
+			if ts.IsZero() {
+				fmt.Printf("                  %-24s %s\n", h, colorize("no data", colDim))
+				continue
+			}
+			age := now.Sub(ts).Round(time.Second)
+			label := colorize("LIVE", colGreen)
+			if age > liveWindow {
+				label = colorize("STALE", colYellow)
+			}
+			fmt.Printf("                  %-24s %s (last %s ago)\n", h, label, age)
+		}
+		return
+	}
+
+	fmt.Printf("hosts:          %d live / %d allowlisted  (live window: %s)\n",
+		len(live), len(allow), liveWindow)
+	for _, h := range allow {
+		ts := newestMTimeForHost(cfg.LogDir, h)
+		switch {
+		case ts.IsZero():
+			fmt.Printf("                  %-24s %s\n", h, colorize("no data yet", colDim))
+		case now.Sub(ts) <= liveWindow:
+			fmt.Printf("                  %-24s %s (last %s ago)\n", h,
+				colorize("LIVE", colGreen), now.Sub(ts).Round(time.Second))
+		default:
+			fmt.Printf("                  %-24s %s (last %s ago)\n", h,
+				colorize("STALE", colYellow), now.Sub(ts).Round(time.Second))
+		}
+	}
+	if len(orphan) > 0 {
+		fmt.Printf("                orphan dirs (data retained, no allowlist entry): %s\n",
+			colorize(strings.Join(orphan, ", "), colDim))
+	}
+	_ = stale
+
+	// Sticky-IP / network-ingest sources. These send authenticated
+	// syslog frames; their host label in <log_dir>/<host>/ is either
+	// the syslog frame's own hostname or the source IP. We can only
+	// freshness-probe the IP-derived dir from here (no frame in
+	// hand), so render them as a separate (syslog source) block.
+	sticky := stickyIPHosts()
+	if len(sticky) > 0 {
+		fmt.Printf("syslog sources: %d allowlisted (network-ingest)\n", len(sticky))
+		for _, h := range sticky {
+			ts := newestMTimeForHost(cfg.LogDir, h)
+			switch {
+			case ts.IsZero():
+				fmt.Printf("                  %-24s %s (no frames received yet at this label)\n", h, colorize("UNSEEN", colDim))
+			case now.Sub(ts) <= liveWindow:
+				fmt.Printf("                  %-24s %s (last %s ago)\n", h,
+					colorize("LIVE", colGreen), now.Sub(ts).Round(time.Second))
+			default:
+				fmt.Printf("                  %-24s %s (last %s ago)\n", h,
+					colorize("STALE", colYellow), now.Sub(ts).Round(time.Second))
+			}
+		}
+	}
+}
+
+// classifyHostLiveness sorts the agent IDs that have on-disk data
+// under base into three buckets relative to the configured allowlist
+// and the freshness window. Returns (live, stale, orphan):
+//   - live: in allowlist AND mtime within window
+//   - stale: in allowlist AND mtime outside window (or no data)
+//   - orphan: NOT in allowlist but a host dir exists (retention)
+func classifyHostLiveness(base string, allow []string, allowSet map[string]struct{}, window time.Duration) (live, stale, orphan []string) {
+	now := time.Now()
+	for _, h := range allow {
+		ts := newestMTimeForHost(base, h)
+		if !ts.IsZero() && now.Sub(ts) <= window {
+			live = append(live, h)
+		} else {
+			stale = append(stale, h)
+		}
+	}
+	for _, dir := range listHosts(base) {
+		if strings.HasPrefix(dir, "_") {
+			continue
+		}
+		if _, ok := allowSet[dir]; ok {
+			continue
+		}
+		orphan = append(orphan, dir)
+	}
+	return live, stale, orphan
+}
+
+// newestMTimeForHost returns the mtime of the newest log file under
+// <base>/<host>/. Zero time means no files exist for that host.
+// Cheap directory walk: at most 7 type dirs * a handful of dated
+// files per type, so this is microseconds even on a busy server.
+func newestMTimeForHost(base, host string) time.Time {
+	hostDir := filepath.Join(base, host)
+	entries, err := os.ReadDir(hostDir)
+	if err != nil {
+		return time.Time{}
+	}
+	var newest time.Time
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		typeDir := filepath.Join(hostDir, e.Name())
+		files, err := os.ReadDir(typeDir)
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			name := f.Name()
+			if !strings.HasSuffix(name, ".jsonl") && !strings.HasSuffix(name, ".jsonl.gz") {
+				continue
+			}
+			info, err := f.Info()
+			if err != nil {
+				continue
+			}
+			if info.ModTime().After(newest) {
+				newest = info.ModTime()
+			}
+		}
+	}
+	return newest
+}
+
+// emitJSONLine writes one event line to the output writer, applying
+// the operator-supplied JSON transforms in this order:
+//
+//  1. --get <dotted.path>      — extract one value, write raw, newline.
+//                                Beats every other formatter — caller
+//                                wants a single field, give them a
+//                                single field. Same semantics as
+//                                `jq -r '.<path>'`.
+//  2. --select a,b,c           — keep only those top-level fields.
+//                                Like `jq '{a,b,c}'` but cheaper.
+//  3. --with-chain / strip     — same as before; chain fields stripped
+//                                by default.
+//  4. --pretty                 — indent the result.
+//
+// Built-in so operators on Windows (where `jq` isn't shipped) get
+// the same usability as Linux/Mac. Pure-Go, no shell-out.
+func emitJSONLine(out *bufio.Writer, line []byte, withChain, pretty bool, selectFields, getPath string) {
+	// --get short-circuits everything — operator wants a raw value.
+	if getPath != "" {
+		v, ok := jsonGetByPath(line, getPath)
+		if !ok {
+			return // missing path = no row, like `jq -r ... // empty`
+		}
+		out.WriteString(v)
+		out.WriteByte('\n')
+		return
+	}
+	// Stage 1: parse once if we need any structural transform.
+	needsParse := !withChain || selectFields != "" || pretty
+	if !needsParse {
+		out.Write(line)
+		out.WriteByte('\n')
+		return
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(line, &obj); err != nil {
+		// Fall back to raw line on parse error — better than dropping
+		// the row entirely (an event might have a non-strict-JSON
+		// quirk we want to surface).
+		out.Write(line)
+		out.WriteByte('\n')
+		return
+	}
+	if !withChain {
+		delete(obj, "_hash")
+		delete(obj, "_prev")
+		delete(obj, "_seq")
+	}
+	if selectFields != "" {
+		keep := map[string]struct{}{}
+		for _, f := range strings.Split(selectFields, ",") {
+			f = strings.TrimSpace(f)
+			if f != "" {
+				keep[f] = struct{}{}
+			}
+		}
+		for k := range obj {
+			if _, ok := keep[k]; !ok {
+				delete(obj, k)
+			}
+		}
+	}
+	var (
+		buf []byte
+		err error
+	)
+	if pretty {
+		buf, err = json.MarshalIndent(obj, "", "  ")
+	} else {
+		buf, err = json.Marshal(obj)
+	}
+	if err != nil {
+		out.Write(line)
+		out.WriteByte('\n')
+		return
+	}
+	out.Write(buf)
+	out.WriteByte('\n')
+}
+
+// jsonGetByPath extracts one value from a JSON line at a dotted
+// path. Path may begin with "." (jq style) or not — both work.
+// Numeric segments index arrays. Returns the value as a string —
+// the same shape `jq -r` produces (raw scalars unquoted, JSON
+// objects/arrays as compact JSON).
+//
+// Examples:
+//   .event           → "user_added"
+//   .data.user       → "alice"
+//   .members.0.name  → "alice"
+//   .                → the whole compact JSON line
+func jsonGetByPath(line []byte, path string) (string, bool) {
+	path = strings.TrimPrefix(strings.TrimSpace(path), ".")
+	var v any
+	if err := json.Unmarshal(line, &v); err != nil {
+		return "", false
+	}
+	if path == "" {
+		// "." → whole document.
+		return marshalJQValue(v), true
+	}
+	for _, seg := range strings.Split(path, ".") {
+		switch cur := v.(type) {
+		case map[string]any:
+			next, ok := cur[seg]
+			if !ok {
+				return "", false
+			}
+			v = next
+		case []any:
+			i, err := strconv.Atoi(seg)
+			if err != nil || i < 0 || i >= len(cur) {
+				return "", false
+			}
+			v = cur[i]
+		default:
+			return "", false
+		}
+	}
+	return marshalJQValue(v), true
+}
+
+// marshalJQValue renders a JSON value the same way `jq -r` does:
+// strings unquoted, numbers/bools as their literal text, null as
+// the empty string (jq -r prints nothing for null), arrays/objects
+// as compact JSON. Cross-platform; no dependency on jq itself.
+func marshalJQValue(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case bool:
+		if t {
+			return "true"
+		}
+		return "false"
+	case float64:
+		// Integers: format without decimal point if exact.
+		if t == float64(int64(t)) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return strconv.FormatFloat(t, 'g', -1, 64)
+	default:
+		buf, _ := json.Marshal(v)
+		return string(buf)
+	}
 }
 
 // csvEscape quotes a CSV/TSV field per RFC 4180 conventions: wrap in
@@ -614,9 +1039,16 @@ func runStatus(args []string) {
 		}
 	}
 	if normaliseMode(cfg.Mode) == "server" {
-		hosts := listHosts(cfg.LogDir)
 		fmt.Printf("listen:         %s\n", cfg.Server.Listen)
-		fmt.Printf("hosts:          %d (%s)\n", len(hosts), strings.Join(hosts, ", "))
+		// Hosts list: live agents only. Previously this walked log_dir
+		// and printed every directory name, which included long-
+		// uninstalled agents whose log dir lingered for retention
+		// AND the standalone-style log-type dirs that aren't agents
+		// at all. Now we cross-reference the configured allowlists
+		// (mTLS + network ingest) with recent on-disk activity so the
+		// list shows AGENTS we've actually heard from inside a 10-min
+		// freshness window.
+		printHostsLive(cfg)
 		// Realm: name + peer count. "default" + 0 peers is a single-server
 		// realm (legacy behaviour); >0 peers is an HA group.
 		realm := cfg.Server.Realm.Name
@@ -677,9 +1109,11 @@ func runStatus(args []string) {
 		showRecentServerErrors(base, 5)
 	}
 	if normaliseMode(cfg.Mode) == "master" {
-		hosts := listHosts(cfg.LogDir)
 		fmt.Printf("master_id:      %s\n", cfg.Master.MasterID)
-		fmt.Printf("hosts:          %d (%s)\n", len(hosts), strings.Join(hosts, ", "))
+		// Hosts list: same live-agents-only filter as server mode —
+		// directory-walk produced confusing output that included
+		// every long-retained host dir as if it were currently active.
+		printHostsLive(cfg)
 		if len(cfg.Master.Servers) == 0 {
 			fmt.Printf("servers:        %s — no servers registered. Run: simplesiem master enroll <url> --key <PSK>\n",
 				colorize("none", colYellow))
@@ -794,16 +1228,27 @@ func runStatus(args []string) {
 			if !dt.IsZero() {
 				dates = append(dates, dt)
 			}
-			if info, err := d.Info(); err == nil {
-				typeBytes += info.Size()
-				// Track the mtime of the file with the newest filename
-				// date (not the newest mtime overall — gzipped historical
-				// files can have fresher mtimes from the rotation pass
-				// itself, which would mislead a freshness check).
-				if !dt.IsZero() && (newestDate.IsZero() || dt.After(newestDate)) {
-					newestDate = dt
-					newestMTime = info.ModTime()
-				}
+			// `os.Stat(path)` instead of `d.Info()` — on Windows the
+			// directory-listing-cached size returned by DirEntry.Info()
+			// can be stale for files currently held open in O_APPEND
+			// mode (the daemon's own writer goroutine), making
+			// `status` show "0 B" while the underlying file actually
+			// holds tens of KiB of events. os.Stat opens the file via
+			// CreateFile + GetFileInformationByHandle which returns
+			// the live size from the file pointer rather than the
+			// MFT directory entry.
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil
+			}
+			typeBytes += info.Size()
+			// Track the mtime of the file with the newest filename
+			// date (not the newest mtime overall — gzipped historical
+			// files can have fresher mtimes from the rotation pass
+			// itself, which would mislead a freshness check).
+			if !dt.IsZero() && (newestDate.IsZero() || dt.After(newestDate)) {
+				newestDate = dt
+				newestMTime = info.ModTime()
 			}
 			return nil
 		})

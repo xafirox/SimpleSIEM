@@ -190,6 +190,37 @@ func shouldRefuseLastServer(cfg Config) bool {
 	return true
 }
 
+// notifyConvertDeparture is the unified "I'm leaving my current role"
+// announcement for every convert path. Fired BEFORE config.json is
+// mutated so the live cfg fields (cfg.Agent.ServerURL, cfg.Server.Realm.Peers,
+// cfg.Master.Servers, cfg.Collector.SourceURL) are still authoritative
+// for resolving who to tell. Best-effort: each underlying notifier
+// swallows errors and proceeds. Centralising the dispatch here means
+// every convert handler — convert.go, convert_master.go,
+// convert_collector.go — gets identical departure semantics, and a new
+// convert variant only needs to call this one helper to avoid leaving
+// stale entries on its old upstream (the user's "agent leaves the
+// realm in any way" requirement).
+func notifyConvertDeparture(cfg Config, from, target string) {
+	if from == target || from == "" || from == "standalone" {
+		return
+	}
+	switch from {
+	case "agent":
+		fmt.Println("notifying old server of agent departure (allowlist cleanup)...")
+		notifyAgentDeparture(cfg)
+	case "server":
+		fmt.Println("notifying realm peers of server departure (realm.peers cleanup)...")
+		notifyServerDeparture(cfg)
+	case "master":
+		fmt.Println("notifying enrolled servers + paired collector of master departure...")
+		notifyMasterDeparture(cfg)
+	case "collector":
+		fmt.Println("notifying paired source of collector departure (slot freed)...")
+		notifyCollectorDeparture(cfg)
+	}
+}
+
 // notifyAgentDeparture: best-effort POST to the server's
 // /v1/agent/depart so the allowlist gets cleaned up immediately.
 // Failures are swallowed — local uninstall proceeds regardless.

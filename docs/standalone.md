@@ -8,9 +8,9 @@ Standalone is the default mode. The daemon collects events from the local host, 
 
 | Type | Captures |
 |---|---|
-| `network` | TCP/UDP open/close, local + remote `ip:port`, reverse-DNS of remote (with public-resolver fallback), provider label (Google/AWS/Cloudflare/...), protocol, owning PID/process/user, process cmdline, connection duration on close |
-| `files` | Created / modified / deleted / renamed / chmod events on watched paths. Includes file size, mode, UID/GID and the resolved username (Linux/macOS) |
-| `auth` | Login / logout sessions plus parsed auth-log events: `ssh_login` (success/failed/invalid_user), `ssh_disconnect`, `sudo` (with command), `su` |
+| `network` | TCP/UDP open/close, local + remote `ip:port`, reverse-DNS of remote (with public-resolver fallback), provider label (Google/AWS/Cloudflare/...), protocol, owning PID/process/user, process cmdline, connection duration on close. **Also**: ICMP / raw-socket destinations (Linux `/proc/net/{icmp,raw,nf_conntrack}`), forward-DNS `query` events (port 53 detection), and `tool_invocation` synthesis from `process_start` cmdlines for known network tools (`ping`/`curl`/`ssh`/`dig`/etc.) — closes the gap that polling alone leaves on sub-second flows |
+| `files` | Created / modified / deleted / renamed / chmod events on watched paths. Includes file size, mode, UID/GID and the resolved username (Linux/macOS). Security-sensitive paths (passwd / shadow / sudoers / SSH keystore / cron / systemd / launchd / scheduled tasks / shell-RC / Windows registry hives) carry a `security_critical` field and `severity` (`high`/`medium`) |
+| `auth` | Login / logout sessions plus parsed auth-log events: `ssh_login` (success/failed/invalid_user), `ssh_disconnect`, `sudo` (with command), `su`. **User-management events** (`user_added` / `user_deleted` / `user_modified` / `user_added_to_group` / `user_removed_from_group` / `group_added` / `group_deleted` / `password_changed`) fire from three independent sources: native auth-log readers, `process_invocation` synthesis from `useradd`/`adduser`/`sysadminctl`/`dscl`/`net user`/PowerShell cmdline parsing, AND `passwd_diff` synthesis from `/etc/passwd` / `/etc/group` / `/etc/shadow` modify events (catches direct `vi /etc/passwd` edits). Cross-platform — same event shape on Linux/Mac/Windows |
 | `processes` | Process start / exit — pid, name, cmdline, starting user, create time, **ppid + parent_name** for ancestry |
 | `traffic` | Host-wide byte + packet counters (sent/received) and per-`(user, process)` active-flow rollups, with `destinations` embedded in `host_io` for instant who-talked-to-whom |
 | `meta` | Daemon lifecycle, rule loads, authlog start, collector silent/recovered, write-queue drops, size-based log rotations |
@@ -83,6 +83,14 @@ Config (`config.json`, `rules.json`), state, and collected logs are preserved. D
 | Linux | `/var/log/simplesiem/` |
 
 Override in `config.json` (`log_dir`) or via the `SIMPLESIEM_LOG_DIR` env var.
+
+To change `log_dir` after install, use the atomic migration command:
+
+```bash
+sudo simplesiem log-dir migrate /new/path -y
+```
+
+The command stops the daemon, moves the existing log tree (cross-filesystem rename or copy-then-delete with full rollback on any error), updates `config.json`, restarts the daemon, and verifies fresh writes are landing at the new path within 30 s. **No install rerun needed on Linux**: the systemd unit's `ReadWritePaths` is generated from the configured `log_dir` at install time, and the post-r4 unit no longer sets `ProtectHome=read-only`, so any path outside `/etc /usr /boot /efi` (still locked by `ProtectSystem=full`) just works. If a misconfiguration ever causes the daemon to silently lose writes, a `meta:storage_write_failed` event fires every 30 s with the offending path and the exact `simplesiem install --log-dir <path>` remediation hint, plus a multi-line stderr banner on the first failure (visible via `journalctl -u simplesiem`).
 
 ### File permissions
 

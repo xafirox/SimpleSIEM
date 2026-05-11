@@ -7,6 +7,33 @@ Rules live in `<config_dir>/rules.json` and are loaded once at daemon startup. T
 
 In **agent** and **master** modes the rule engine does NOT run. Agents have nothing to alert on locally (collected events go to the server); masters are read-only aggregators (alerts replicate from origin servers along with other events).
 
+## Quick start — stepwise CLI (no JSON to type)
+
+The recommended way to add a rule is the stepwise CLI: `rules new` creates a disabled draft, each subsequent verb sets one field, and `rules enable` runs a required-field audit + the daemon parser before flipping the rule live. Drafts are silently skipped by the runtime loader, so an in-progress build never fires.
+
+```
+sudo simplesiem rules new ssh-brute
+sudo simplesiem rules set ssh-brute severity high
+sudo simplesiem rules match ssh-brute type auth
+sudo simplesiem rules match ssh-brute event ssh_login
+sudo simplesiem rules match ssh-brute result --any failed,invalid_user
+sudo simplesiem rules threshold ssh-brute 5 60s remote
+sudo simplesiem rules set ssh-brute dedup-window 5m
+sudo simplesiem rules set ssh-brute tactic TA0006
+sudo simplesiem rules set ssh-brute technique T1110.001
+sudo simplesiem rules enable ssh-brute
+```
+
+The match operators surface every form the engine supports — `--regex`, `--substr`, `--cidr`, `--not-cidr`, `--in-file`, `--not-in-file`, `--gt`, `--lt`, `--ge`, `--le`, `--any` — and each is validated at the moment of the `set` (the regex must compile, the CIDR must parse, the MITRE ID must match the format). If `enable` fails, it lists *every* missing field at once:
+
+```
+cannot enable: rule "ssh-brute" is not yet complete:
+  - severity: not set (run `rules set <id> severity <low|medium|high|critical>`)
+  - match: at least one match key OR a sequence is required (run `rules match <id> <key> <value>` or `rules sequence-step <id> key=value...`)
+```
+
+`rules validate <id>` runs the same audit without changing state. Power users wanting to drop a hand-authored rule (or import many at once) can still use `rules add <file|->`. Both paths land in the same `rules.json` and the daemon hot-reloads either within ~1 s.
+
 ## Rule format
 
 Each rule is a JSON object:

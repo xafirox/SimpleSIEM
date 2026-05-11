@@ -372,6 +372,16 @@ type restoreTx struct {
 // restoreSwap captures everything we need to atomically install one
 // staged subtree at its final destination AND undo that work later
 // if a sibling swap fails.
+//
+// nestedUnder names another tree whose staging this tree's content
+// piggybacks inside (so renaming the outer staging atomically promotes
+// the inner content too). When nestedUnder is set, this swap is a
+// pure "extract here" record — it never participates in
+// preserve/promote in commit(). Without this, the default Windows
+// layout (state and logs nested under config) breaks the
+// preserve/promote sequence: renaming config aside makes the nested
+// state/logs paths disappear and the next preserve fails with
+// ERROR_FILE_NOT_FOUND.
 type restoreSwap struct {
 	tree           string // "config" / "state" / "logs" / "loose"
 	stagingDir     string // sibling staging dir, lives until commit
@@ -382,6 +392,7 @@ type restoreSwap struct {
 	backedUp       bool   // dstDir → preRestoreDir succeeded
 	promoted       bool   // stagingDir → dstDir succeeded
 	hadEntries     bool   // at least one tar entry landed in stagingDir
+	nestedUnder    string // outer tree name when dstDir is INSIDE another tree's dstDir
 }
 
 func newRestoreTx(dest restoreTargets) *restoreTx {
@@ -415,6 +426,15 @@ func (tx *restoreTx) prepareStaging() error {
 		{"state", tx.dest.stateDir},
 		{"logs", tx.dest.logDir},
 	}
+	// First pass: build the swap records. Detect nesting (e.g. on
+	// Windows, default state and logs paths sit INSIDE the default
+	// config path). When tree T's dst is inside another tree's dst,
+	// route T's staging dir to a subdir of the outer tree's staging
+	// — so a single outer-level rename atomically promotes both
+	// content trees together. Without this, sequential preserve/
+	// promote in commit() breaks the moment the outer rename moves
+	// the inner path out of existence.
+	swapByName := map[string]*restoreSwap{}
 	for _, t := range trees {
 		if t.dst == "" {
 			continue
@@ -422,12 +442,55 @@ func (tx *restoreTx) prepareStaging() error {
 		s := &restoreSwap{
 			tree:          t.name,
 			dstDir:        t.dst,
-			stagingDir:    t.dst + ".restore-staging-" + tx.utcStamp,
 			preRestoreDir: t.dst + ".pre-restore-" + tx.utcStamp,
 		}
 		if _, err := os.Stat(s.dstDir); err == nil {
 			s.dstExisted = true
 		}
+		swapByName[t.name] = s
+		tx.swaps = append(tx.swaps, s)
+	}
+	// Second pass: detect nesting and assign staging dirs accordingly.
+	// Outermost swaps get a sibling staging dir; nested swaps get a
+	// subdir under their outer's staging.
+	for _, t := range trees {
+		s := swapByName[t.name]
+		if s == nil {
+			continue
+		}
+		var outer *restoreSwap
+		for _, o := range trees {
+			if o.name == t.name {
+				continue
+			}
+			cand := swapByName[o.name]
+			if cand == nil {
+				continue
+			}
+			if pathInside(s.dstDir, cand.dstDir) {
+				if outer == nil || pathInside(cand.dstDir, outer.dstDir) {
+					outer = cand
+				}
+			}
+		}
+		if outer != nil {
+			// Stage inside the outer's staging. The relative path
+			// preserves the nested layout so the post-promote tree
+			// has state/logs at their expected sub-paths.
+			rel, err := filepath.Rel(outer.dstDir, s.dstDir)
+			if err != nil {
+				return err
+			}
+			s.stagingDir = filepath.Join(outer.stagingDir, rel)
+			s.nestedUnder = outer.tree
+			if err := os.MkdirAll(s.stagingDir, 0o700); err != nil {
+				return err
+			}
+			s.stagingCreated = true
+			continue
+		}
+		// Outermost: sibling staging dir.
+		s.stagingDir = s.dstDir + ".restore-staging-" + tx.utcStamp
 		if err := tx.ensureParent(s.dstDir); err != nil {
 			return err
 		}
@@ -435,9 +498,37 @@ func (tx *restoreTx) prepareStaging() error {
 			return err
 		}
 		s.stagingCreated = true
-		tx.swaps = append(tx.swaps, s)
+	}
+	// Sanity: outer swaps must be processed before nested ones in the
+	// stagingPathFor walk so writeStagedEntry sees parent dirs first.
+	// Sort: outer (no nestedUnder) before inner.
+	for i := 0; i < len(tx.swaps); i++ {
+		for j := i + 1; j < len(tx.swaps); j++ {
+			if tx.swaps[i].nestedUnder != "" && tx.swaps[j].nestedUnder == "" {
+				tx.swaps[i], tx.swaps[j] = tx.swaps[j], tx.swaps[i]
+			}
+		}
 	}
 	return nil
+}
+
+// pathInside reports whether child is strictly under parent (not equal,
+// not unrelated). Both paths are cleaned and normalised to forward
+// slashes for cross-platform comparison.
+func pathInside(child, parent string) bool {
+	if child == "" || parent == "" {
+		return false
+	}
+	cClean := filepath.Clean(child)
+	pClean := filepath.Clean(parent)
+	if cClean == pClean {
+		return false
+	}
+	rel, err := filepath.Rel(pClean, cClean)
+	if err != nil {
+		return false
+	}
+	return rel != "" && !strings.HasPrefix(rel, "..") && rel != "."
 }
 
 // ensureParent ensures filepath.Dir(p) exists, recording any
@@ -531,6 +622,14 @@ func (tx *restoreTx) commit() error {
 			// promote. Leave the destination alone.
 			continue
 		}
+		if s.nestedUnder != "" {
+			// Inner tree: its content already lives inside the outer
+			// tree's staging dir, so the outer's atomic rename
+			// promotes it too. Mark promoted=true for rollback
+			// bookkeeping symmetry.
+			s.promoted = true
+			continue
+		}
 		if s.dstExisted {
 			// safeRenameDir falls back to copy+remove on EXDEV
 			// (overlayfs lower-layer rename, true cross-mount).
@@ -557,6 +656,14 @@ func (tx *restoreTx) rollback() {
 	// 1. Undo any successful per-tree swaps in reverse.
 	for i := len(tx.swaps) - 1; i >= 0; i-- {
 		s := tx.swaps[i]
+		if s.nestedUnder != "" {
+			// Nested swap: its content lived inside the outer tree's
+			// staging, so it was promoted/preserved as part of the
+			// outer's rename. There is no inner-level state to undo.
+			// stagingCreated paths are inside the outer's staging dir
+			// which the outer's rollback handles.
+			continue
+		}
 		if s.promoted {
 			// stagingDir is now at dstDir; remove it.
 			_ = os.RemoveAll(s.dstDir)

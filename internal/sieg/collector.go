@@ -73,6 +73,12 @@ func startCollectorDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (
 		collectorStore.SetRules(rules)
 		localStore.SetRules(rules)
 	}
+	if cfg.RulesPath != "" {
+		startRulesWatcher(ctx, wg, cfg.RulesPath, func(rules []*alertRule) {
+			collectorStore.SetRules(rules)
+			localStore.SetRules(rules)
+		}, localStore)
+	}
 
 	// Collectors never bind the network-ingest listener — but they DO
 	// report their own gateway up to their source (master or server)
@@ -105,6 +111,10 @@ func startCollectorDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (
 	startRetention(ctx, wg, cfg.LogDir, cfg.RetentionDays)
 	startLocalCollectors(ctx, wg, cfg, localStore, collectorStore)
 	startCertExpiryMonitor(ctx, wg, collectorStore, "collector", collectCollectorCertPaths(cfg))
+	// Heartbeat under _collector so a collector that's between pull
+	// cycles (default interval is once per day) doesn't trip the
+	// wedge detector.
+	startDaemonHeartbeat(ctx, wg, collectorStore, "collector")
 	// Hourly signing of chain heads — covers the collector's local
 	// collection (NOT the replicated `.from-*` mirror files; those
 	// belong to the origin signer).
@@ -760,7 +770,7 @@ func (s *serverState) handleEnrollCollector(w http.ResponseWriter, r *http.Reque
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: er.CollectorID, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(s.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},

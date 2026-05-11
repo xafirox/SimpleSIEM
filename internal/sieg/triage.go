@@ -38,7 +38,14 @@ func runTriage(args []string) {
 	windowFlag := fs.Duration("window", 30*time.Second, "time window before/after each pivot (implies --at now when used alone)")
 	maxPivots := fs.Int("max-pivots", 10, "stop after this many pivots")
 	scanDays := fs.Int("scan-days", 30, "how far back to scan for pivots")
-	jsonOut := fs.Bool("json", false, "emit raw JSONL instead of the formatted table (for piping into jq)")
+	jsonOut := fs.Bool("json", false, "emit raw JSONL instead of the formatted table")
+	// Built-in jq-equivalent flags so operators on Windows (where
+	// `jq` isn't shipped) get the same single-binary experience.
+	// All three only fire when --json is also set; the formatted
+	// table mode owns its own rendering.
+	pretty := fs.Bool("pretty", false, "pretty-print JSON (indented; equivalent to `jq .`); requires --json")
+	selectFields := fs.String("select", "", "comma-separated field allowlist for JSON output (equivalent to `jq '{a,b}'`); requires --json")
+	getPath := fs.String("get", "", "extract one dotted path per matched event (equivalent to `jq -r '.a.b'`); requires --json")
 	cfgPath := fs.String("config", defaultConfigPath(), "config file")
 	explain := fs.Bool("explain", false, "for alert events, show which rule fields matched")
 	noColor := fs.Bool("no-color", false, "disable ANSI colour")
@@ -114,10 +121,13 @@ func runTriage(args []string) {
 			events = filtered
 		}
 		if *jsonOut {
+			out := bufio.NewWriter(os.Stdout)
+			defer out.Flush()
 			for _, e := range events {
-				if e.Raw != "" {
-					fmt.Println(e.Raw)
+				if e.Raw == "" {
+					continue
 				}
+				emitJSONLine(out, []byte(e.Raw), false /*withChain*/, *pretty, *selectFields, *getPath)
 			}
 			return
 		}
@@ -182,7 +192,7 @@ See 'simplesiem triage -h' for all flags.`)
 	roots := searchRoots(cfg, *hostFilter)
 	for i, p := range pivots {
 		if *jsonOut {
-			emitTriageJSONMulti(roots, p, *windowFlag, *typFlag)
+			emitTriageJSONMulti(roots, p, *windowFlag, *typFlag, *pretty, *selectFields, *getPath)
 			continue
 		}
 		if i > 0 {
@@ -336,10 +346,11 @@ func parseFriendlyTime(s string) (time.Time, bool) {
 		}
 	}
 
-	anchor := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local)
+	loc := resolveDisplayLoc()
+	anchor := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, loc)
 	anchor = anchor.AddDate(0, 0, dayOffset)
 	if datePart != "" {
-		d, err := time.ParseInLocation("2006-01-02", datePart, time.Local)
+		d, err := time.ParseInLocation("2006-01-02", datePart, loc)
 		if err != nil {
 			return time.Time{}, false
 		}
@@ -357,7 +368,7 @@ func parseFriendlyTime(s string) (time.Time, bool) {
 	if !ok {
 		return time.Time{}, false
 	}
-	return time.Date(anchor.Year(), anchor.Month(), anchor.Day(), h, m, sec, 0, time.Local), true
+	return time.Date(anchor.Year(), anchor.Month(), anchor.Day(), h, m, sec, 0, loc), true
 }
 
 func looksLikeDate(s string) bool {
@@ -519,8 +530,14 @@ func loadEventsInRange(base string, start, end time.Time, typeFilter string) []E
 	if typeFilter != "" {
 		types = []string{typeFilter}
 	}
-	startDay := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
-	endDay := time.Date(end.Year(), end.Month(), end.Day(), 0, 0, 0, 0, time.UTC)
+	// Day boundaries are computed in UTC because Storage names files by
+	// UTC date (`time.Now().UTC().Format("2006-01-02")`). Without the
+	// .UTC() conversion, an operator running queries near local midnight
+	// on the wrong side of the UTC boundary saw the day's events
+	// silently skipped — the file's UTC-named date was "after" the
+	// locally-computed endDay.
+	startDay := time.Date(start.UTC().Year(), start.UTC().Month(), start.UTC().Day(), 0, 0, 0, 0, time.UTC)
+	endDay := time.Date(end.UTC().Year(), end.UTC().Month(), end.UTC().Day(), 0, 0, 0, 0, time.UTC)
 	var out []Event
 	for _, t := range types {
 		for _, path := range listLogFilesForType(base, t) {
@@ -703,6 +720,43 @@ func eventSummary(e Event) string {
 		case "su":
 			return fmt.Sprintf("su %s by %s -> %s",
 				strField(e.Data, "result"), strField(e.Data, "user"), strField(e.Data, "target"))
+		case "user_added":
+			parts := []string{"user_added " + strField(e.Data, "user")}
+			if uid := strField(e.Data, "uid"); uid != "" {
+				parts = append(parts, "uid="+uid)
+			}
+			if gid := strField(e.Data, "gid"); gid != "" {
+				parts = append(parts, "gid="+gid)
+			}
+			if home := strField(e.Data, "home"); home != "" {
+				parts = append(parts, "home="+home)
+			}
+			if shell := strField(e.Data, "shell"); shell != "" {
+				parts = append(parts, "shell="+shell)
+			}
+			return strings.Join(parts, " ")
+		case "user_deleted":
+			return "user_deleted " + strField(e.Data, "user")
+		case "user_added_to_group":
+			return fmt.Sprintf("user_added_to_group %s -> %s",
+				strField(e.Data, "user"), strField(e.Data, "group"))
+		case "user_modified":
+			return fmt.Sprintf("user_modified %s: %s",
+				strField(e.Data, "user"), strField(e.Data, "change"))
+		case "user_shell_changed":
+			return fmt.Sprintf("user_shell_changed %s -> %s",
+				strField(e.Data, "user"), strField(e.Data, "shell"))
+		case "group_added":
+			gid := strField(e.Data, "gid")
+			if gid == "" {
+				return "group_added " + strField(e.Data, "group")
+			}
+			return fmt.Sprintf("group_added %s gid=%s",
+				strField(e.Data, "group"), gid)
+		case "group_deleted":
+			return "group_deleted " + strField(e.Data, "group")
+		case "password_changed":
+			return "password_changed for " + strField(e.Data, "user")
 		}
 		return fmt.Sprintf("%s user=%s terminal=%s host=%s",
 			ev, strField(e.Data, "user"), strField(e.Data, "terminal"), strField(e.Data, "host"))
@@ -725,6 +779,24 @@ func eventSummary(e Event) string {
 				formatBytes(e.Data["bytes_recv"]))
 			if dests := formatDestinations(e.Data["destinations"], 5); dests != "" {
 				base += " -> " + dests
+			} else if numField(e.Data, "bytes_sent") > 0 || numField(e.Data, "bytes_recv") > 0 {
+				// Bytes flowed but no TCP/UDP socket was visible at
+				// poll time. Common causes: ICMP (ping), raw sockets,
+				// or a TCP flow that opened+closed between polls.
+				// Spell that out so the operator doesn't read "no
+				// destinations" as "broken collector" (the s7
+				// "where it was sent" complaint).
+				base += " (no active TCP/UDP socket at poll time — likely ICMP/raw or sub-poll TCP)"
+			}
+			// ICMP deltas (Linux). When the host pinged something
+			// during this window, the icmp_* fields are populated;
+			// surface them inline so the operator sees "ping
+			// happened" without `--type traffic --grep icmp`.
+			if pieces := formatICMPDelta(e.Data); pieces != "" {
+				base += " icmp:" + pieces
+			}
+			if iface := formatPerIface(e.Data["per_iface"], 3); iface != "" {
+				base += " [" + iface + "]"
 			}
 			return base
 		}
@@ -937,6 +1009,83 @@ func renderTarget(host, remote string) string {
 // user/process and remote/remote_host the way the active_connection summary
 // does so the two look consistent. Sorted by count desc so the noisiest
 // talkers show first. top bounds how many distinct entries are listed.
+// formatICMPDelta renders the host_io ICMP-counter fields as a
+// compact string suitable for the inline triage summary. Empty
+// when no ICMP activity was recorded for this poll window. Echoes
+// (request) and echo replies are called out specifically because
+// "ping" is what operators expect to see captured.
+func formatICMPDelta(data map[string]any) string {
+	parts := []string{}
+	if v := numField(data, "icmp_echo_out"); v > 0 {
+		parts = append(parts, fmt.Sprintf("ping_sent=%d", v))
+	}
+	if v := numField(data, "icmp_echo_reply_in"); v > 0 {
+		parts = append(parts, fmt.Sprintf("ping_reply_recv=%d", v))
+	}
+	if v := numField(data, "icmp_echo_in"); v > 0 {
+		parts = append(parts, fmt.Sprintf("ping_recv=%d", v))
+	}
+	if v := numField(data, "icmp_echo_reply_out"); v > 0 {
+		parts = append(parts, fmt.Sprintf("ping_reply_sent=%d", v))
+	}
+	// If there was non-echo ICMP traffic (unreachable, time-exceeded,
+	// etc.), still surface the totals so they're not invisible.
+	if len(parts) == 0 {
+		out := numField(data, "icmp_out")
+		in := numField(data, "icmp_in")
+		if out > 0 || in > 0 {
+			return fmt.Sprintf(" out=%d in=%d", out, in)
+		}
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
+}
+
+// formatPerIface renders the host_io.per_iface array as a compact
+// "eth0 +2.1 KB / -200 B, lo +120 B / -120 B" string. Sorted by
+// bytes_sent descending. Empty when v is missing or nothing flowed.
+// Limited to `top` interfaces for terse triage output.
+func formatPerIface(v any, top int) string {
+	list, ok := v.([]any)
+	if !ok || len(list) == 0 {
+		return ""
+	}
+	type ifaceRow struct {
+		name string
+		sent int64
+		recv int64
+	}
+	rows := make([]ifaceRow, 0, len(list))
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := strField(m, "name")
+		if name == "" {
+			continue
+		}
+		rows = append(rows, ifaceRow{
+			name: name,
+			sent: numField(m, "bytes_sent"),
+			recv: numField(m, "bytes_recv"),
+		})
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].sent > rows[j].sent })
+	if top > 0 && len(rows) > top {
+		rows = rows[:top]
+	}
+	parts := make([]string, 0, len(rows))
+	for _, r := range rows {
+		parts = append(parts, fmt.Sprintf("%s ↑%s ↓%s",
+			r.name, formatBytes(r.sent), formatBytes(r.recv)))
+	}
+	return strings.Join(parts, ", ")
+}
+
 func formatDestinations(v any, top int) string {
 	list, ok := v.([]any)
 	if !ok || len(list) == 0 {

@@ -86,6 +86,14 @@ func runConvertCollector(args []string) {
 		fatalf("PSK is required")
 	}
 
+	// Notify the previous role's coordinators BEFORE enrollment so the
+	// upstream allowlist / realm.peers / master.servers gets the
+	// departure signal while our local cfg fields are still
+	// authoritative. agent -> collector tells the old server, server ->
+	// collector tells realm peers, master -> collector tells enrolled
+	// servers, etc.
+	notifyConvertDeparture(cfg, from, "collector")
+
 	// Run the same enrollment path as `simplesiem collector enroll`.
 	// On failure the function calls fatalf — config is left untouched.
 	enrollArgs := []string{url, "--key", psk, "--config", *cfgPath}

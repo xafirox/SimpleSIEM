@@ -223,7 +223,7 @@ func runCertsInit(args []string) {
 			CommonName:   "SimpleSIEM Root CA",
 			Organization: []string{"SimpleSIEM"},
 		},
-		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotBefore:             time.Now().Add(-24 * time.Hour),
 		NotAfter:              time.Now().AddDate(*years, 0, 0),
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
@@ -324,13 +324,48 @@ func ensureServerPKI(cfgPath string, caYears, srvYears int) (bool, []string, err
 	var caCert *x509.Certificate
 	var caKey *ecdsa.PrivateKey
 
-	// 1. CA: generate only if absent. Re-running into an existing CA
-	//    must NOT replace it — that would invalidate every agent
-	//    cert in the field.
-	if _, err := os.Stat(caPath); err != nil {
-		if !os.IsNotExist(err) {
-			return false, nil, fmt.Errorf("stat CA: %w", err)
+	// 1. CA: generate only when BOTH ca.pem and ca.key are absent.
+	//    - Both present:   load existing — re-running into an in-use CA
+	//      must NOT replace it; that would invalidate every agent cert
+	//      in the field.
+	//    - Both absent:    bootstrap fresh.
+	//    - One without the other (PARTIAL state): orphaned. Move the
+	//      lone file aside (preserved as <file>.orphaned.<UTC> for
+	//      audit) and fall through to fresh bootstrap. Common after
+	//      `convert agent -> server`: the agent's ca.pem is the OLD
+	//      server's trust anchor, kept on disk after enrollment, but
+	//      never had a matching ca.key on this host (agents don't own
+	//      one). Without this branch, ensureServerPKI sees ca.pem and
+	//      dies in `loadCAFromDisk` trying to read the absent ca.key,
+	//      leaving the convert in the half-state the user reported.
+	caCertErr := func() error { _, e := os.Stat(caPath); return e }()
+	caKeyErr := func() error { _, e := os.Stat(caKeyPath); return e }()
+	hasCert := caCertErr == nil
+	hasKey := caKeyErr == nil
+	if (hasCert && !os.IsNotExist(caKeyErr) && !hasKey) || (hasKey && !os.IsNotExist(caCertErr) && !hasCert) {
+		// Real I/O error on the absent side (permission denied, etc.).
+		// Don't paper over that.
+		err := caKeyErr
+		if hasKey {
+			err = caCertErr
 		}
+		return false, nil, fmt.Errorf("stat CA: %w", err)
+	}
+	if hasCert != hasKey {
+		// Partial state. Orphan one or the other.
+		orphan := caPath
+		if hasKey {
+			orphan = caKeyPath
+		}
+		backup := orphan + ".orphaned." + time.Now().UTC().Format("20060102T150405Z")
+		if err := os.Rename(orphan, backup); err != nil {
+			return false, nil, fmt.Errorf("partial CA state (only %s present, no matching pair on disk); could not move orphan aside to %s: %w. Remove %s manually and retry, OR restore the missing matching file.", filepath.Base(orphan), backup, err, orphan)
+		}
+		lines = append(lines, fmt.Sprintf("orphan %s moved to %s (no matching key/cert pair — typically an agent->server conversion leftover; bootstrapping a fresh CA below)", filepath.Base(orphan), filepath.Base(backup)))
+		hasCert, hasKey = false, false
+	}
+
+	if !hasCert {
 		k, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 		if err != nil {
 			return false, nil, fmt.Errorf("generate CA key: %w", err)
@@ -342,8 +377,16 @@ func ensureServerPKI(cfgPath string, caYears, srvYears int) (bool, []string, err
 				CommonName:   "SimpleSIEM Root CA",
 				Organization: []string{"SimpleSIEM"},
 			},
-			NotBefore:             time.Now().Add(-1 * time.Hour),
-			NotAfter:              time.Now().AddDate(caYears, 0, 0),
+			// 24h backdate (was -1h) so cross-platform deployments
+			// where one host's clock is several hours off (typical in
+			// a fleet that mixes hardware-clock-set-to-local-time
+			// Windows VMs with UTC-based Linux VMs) don't trip "x509:
+			// certificate has expired or is not yet valid" during
+			// enrollment. Picks 24h because that's longer than any
+			// realistic timezone skew without making the CA
+			// retroactively trusted for a long pre-issuance window.
+			NotBefore: time.Now().Add(-24 * time.Hour),
+			NotAfter:  time.Now().AddDate(caYears, 0, 0),
 			KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 			BasicConstraintsValid: true,
 			IsCA:                  true,
@@ -576,7 +619,7 @@ func extendServerCertSAN(certsDir, addedHost string) (bool, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: hosts[0], Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		// Match the original cert's NotAfter so SAN extension doesn't
 		// reset the validity window unexpectedly.
 		NotAfter:    cur.NotAfter,
@@ -682,7 +725,7 @@ func issueServerCert(dir string, caCert *x509.Certificate, caKey *ecdsa.PrivateK
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: hosts[0], Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(years, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		// Both ServerAuth and ClientAuth: this cert is used as the

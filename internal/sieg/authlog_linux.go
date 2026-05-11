@@ -171,6 +171,22 @@ var (
 	reSudoFail    = regexp.MustCompile(`sudo:\s+pam_unix\(sudo:auth\):\s+authentication failure;.*?(?:user|ruser)=(\S+)`)
 	reSuOpen      = regexp.MustCompile(`su(?:\[\d+\])?:\s+pam_unix\(su(?:-l)?:session\):\s+session opened for user\s+(\S+)\s+by\s+(\S+?)(?:\(uid=\d+\))?$`)
 	reSuFailed    = regexp.MustCompile(`su(?:\[\d+\])?:\s+FAILED SU\s+\(to\s+(\S+)\)\s+(\S+)\s+on\s+(\S+)`)
+
+	// Local-account lifecycle events. shadow-utils logs these on
+	// every distro that uses the standard tooling. Without these
+	// patterns, an operator who runs `useradd attacker` sees
+	// nothing in `auth/` — only a generic process event from the
+	// process collector — which is the s2 manual-test complaint:
+	// "the simplesiem did log a new user, but using triage does
+	// not reflect what happened, only that root started a process".
+	reUserAdd     = regexp.MustCompile(`useradd\[\d+\]:\s+new user:\s+name=(\S+?),\s+UID=(\d+),\s+GID=(\d+)(?:,\s+home=(\S+?))?(?:,\s+shell=(\S+))?`)
+	reUserAddGrp  = regexp.MustCompile(`useradd\[\d+\]:\s+add\s+'(\S+?)'\s+to\s+group\s+'(\S+?)'`)
+	reUserDel     = regexp.MustCompile(`userdel\[\d+\]:\s+delete user\s+'(\S+?)'`)
+	reUserMod     = regexp.MustCompile(`usermod\[\d+\]:\s+(?:change user\s+'(\S+?)'\s+(\S.+)|add\s+'(\S+?)'\s+to\s+group\s+'(\S+?)')`)
+	reGroupAdd    = regexp.MustCompile(`groupadd\[\d+\]:\s+new group:\s+name=(\S+?),\s+GID=(\d+)`)
+	reGroupDel    = regexp.MustCompile(`groupdel\[\d+\]:\s+group\s+'(\S+?)'\s+removed`)
+	rePasswd      = regexp.MustCompile(`passwd\[\d+\]:\s+pam_unix\(passwd:chauthtok\):\s+password changed for\s+(\S+)`)
+	reChsh        = regexp.MustCompile(`chsh\[\d+\]:\s+changed user\s+'(\S+?)'\s+shell to\s+'(\S+?)'`)
 )
 
 // parseAuthLine matches a single syslog line against the supported patterns
@@ -221,6 +237,51 @@ func parseAuthLine(line string) map[string]any {
 		return map[string]any{
 			"event": "su", "target": m[1], "user": m[2],
 			"terminal": m[3], "result": "failed",
+		}
+	}
+	if m := reUserAdd.FindStringSubmatch(line); m != nil {
+		ev := map[string]any{
+			"event": "user_added", "user": m[1], "uid": m[2], "gid": m[3],
+		}
+		if m[4] != "" {
+			ev["home"] = m[4]
+		}
+		if m[5] != "" {
+			ev["shell"] = m[5]
+		}
+		return ev
+	}
+	if m := reUserAddGrp.FindStringSubmatch(line); m != nil {
+		return map[string]any{
+			"event": "user_added_to_group", "user": m[1], "group": m[2],
+		}
+	}
+	if m := reUserDel.FindStringSubmatch(line); m != nil {
+		return map[string]any{"event": "user_deleted", "user": m[1]}
+	}
+	if m := reUserMod.FindStringSubmatch(line); m != nil {
+		// Two alternation branches; pick whichever captured.
+		if m[1] != "" {
+			return map[string]any{
+				"event": "user_modified", "user": m[1], "change": m[2],
+			}
+		}
+		return map[string]any{
+			"event": "user_added_to_group", "user": m[3], "group": m[4],
+		}
+	}
+	if m := reGroupAdd.FindStringSubmatch(line); m != nil {
+		return map[string]any{"event": "group_added", "group": m[1], "gid": m[2]}
+	}
+	if m := reGroupDel.FindStringSubmatch(line); m != nil {
+		return map[string]any{"event": "group_deleted", "group": m[1]}
+	}
+	if m := rePasswd.FindStringSubmatch(line); m != nil {
+		return map[string]any{"event": "password_changed", "user": m[1]}
+	}
+	if m := reChsh.FindStringSubmatch(line); m != nil {
+		return map[string]any{
+			"event": "user_shell_changed", "user": m[1], "shell": m[2],
 		}
 	}
 	return nil

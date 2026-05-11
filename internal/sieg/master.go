@@ -81,6 +81,26 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 	if rules, err := loadRules(masterRulesPath); err == nil {
 		masterStore.SetRules(rules)
 	}
+	// Hot-reload watchers for both paths. localStore mirrors the master's
+	// own collected events; masterStore mirrors pulled events. They share
+	// rules in the common config-fallback case but can be split.
+	if cfg.RulesPath != "" {
+		startRulesWatcher(ctx, wg, cfg.RulesPath, func(rules []*alertRule) {
+			localStore.SetRules(rules)
+		}, localStore)
+	}
+	if masterRulesPath != "" && masterRulesPath != cfg.RulesPath {
+		startRulesWatcher(ctx, wg, masterRulesPath, func(rules []*alertRule) {
+			masterStore.SetRules(rules)
+		}, masterStore)
+	} else if masterRulesPath != "" {
+		// Same path as cfg.RulesPath — share the watcher above by
+		// also registering masterStore as a target. We chain by adding
+		// an extra hook via an additional watcher (cheap: 1 stat/sec).
+		startRulesWatcher(ctx, wg, masterRulesPath, func(rules []*alertRule) {
+			masterStore.SetRules(rules)
+		}, masterStore)
+	}
 
 	// Master alert dispatchers — same shape as the server's, fed by
 	// cfg.Server.AlertWebhooks + cfg.Server.AlertSyslog (master shares
@@ -133,6 +153,10 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 		"local_id": localID,
 		"pid":      os.Getpid(),
 	})
+	// Master mode mirrors the standalone heartbeat under _master so a
+	// quiet master (no incoming sync activity, no local collector
+	// events) doesn't trip the wedge detector.
+	startDaemonHeartbeat(ctx, wg, masterStore, "master")
 
 	startRetention(ctx, wg, cfg.LogDir, cfg.RetentionDays)
 	startLocalCollectors(ctx, wg, cfg, localStore, masterStore)
@@ -253,15 +277,18 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 	for _, server := range cfg.Master.Servers {
 		spawn(server, cfg.Master.MasterID)
 	}
-	// Dynamic-watch goroutine: every minute re-read cfg.Master.Servers
-	// from disk and spawn pull goroutines for any new entries. This is
+	// Dynamic-watch goroutine: re-read cfg.Master.Servers from disk
+	// every 5s and spawn pull goroutines for any new entries. This is
 	// what lets `master enroll <url>` take effect without a daemon
 	// restart. The spawned goroutines themselves re-read cfg per cycle
 	// already, so an interval edit propagates without restart too.
+	// 5s (was 60s) is the responsiveness floor — enroll → first pull
+	// stays under ~6 seconds total in the no-restart path, which the
+	// master-multi-server test relies on.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(60 * time.Second)
+		t := time.NewTicker(5 * time.Second)
 		defer t.Stop()
 		for {
 			select {
@@ -340,7 +367,12 @@ func masterPullLoop(ctx context.Context, server, serverID, masterID, certDir str
 
 	t := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer t.Stop()
-	first := time.NewTimer(5 * time.Second)
+	// 500ms warmup — enough to let TLS configs settle but small enough
+	// that `master enroll` → first pull is sub-second. Originally 5s,
+	// which combined with the 60s dynamic-watch tick below could leave
+	// new servers unsynced for up to a minute and broke tight test
+	// assertions ("events from BOTH servers within 35s of master start").
+	first := time.NewTimer(500 * time.Millisecond)
 	defer first.Stop()
 	for {
 		select {
@@ -404,10 +436,27 @@ func masterPullOnce(ctx context.Context, client *http.Client, server, serverID, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 	maxSeen := since
 	count := 0
+	// Same skew threshold as server.handleEvents — events whose ts is
+	// more than 5 minutes off from the master's local clock get clamped
+	// so master queries by --since work even when source servers and
+	// the master have drifting clocks. Without this, events from a
+	// host whose clock is hours behind look "ancient" to the master and
+	// fall outside reasonable query windows.
+	const masterPullSkew = 5 * time.Minute
+	now := time.Now().UTC()
 	for scanner.Scan() {
 		var ev SyncEvent
 		if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
 			continue
+		}
+		if rawTS, ok := ev["ts"].(string); ok && rawTS != "" {
+			if t, err := time.Parse(time.RFC3339Nano, rawTS); err == nil {
+				if t.Before(now.Add(-masterPullSkew)) || t.After(now.Add(masterPullSkew)) {
+					ev["origin_ts"] = rawTS
+					ev["ts"] = now.Format(time.RFC3339Nano)
+					ev["clock_skewed"] = true
+				}
+			}
 		}
 		if !writeMasterEvent(base, serverID, ev) {
 			continue

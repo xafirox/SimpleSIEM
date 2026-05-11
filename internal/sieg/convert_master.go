@@ -95,6 +95,11 @@ func runConvertMaster(args []string) {
 		if perr := validateMasterServerURL(*oneShotServer); perr != nil {
 			fatalf("invalid --server URL: %v", perr)
 		}
+		// Notify the previous role's coordinators BEFORE saveConfig so
+		// stale entries don't linger on the upstream side. agent -> master
+		// tells the old server to drop us from agent_allowlist; server ->
+		// master tells realm peers to drop us from realm.peers; etc.
+		notifyConvertDeparture(cfg, from, "master")
 		fmt.Printf("enrolling with %s ...\n", *oneShotServer)
 		res, err := enrollMasterWithServer(*cfgPath, *oneShotServer, *oneShotKey, *masterID)
 		if err != nil {
@@ -180,6 +185,12 @@ func runConvertMaster(args []string) {
 		fmt.Println("no servers enrolled; aborting (config unchanged).")
 		return
 	}
+
+	// Notify the previous role's coordinators BEFORE we stop the daemon
+	// or rewrite config. Same rationale as the one-shot path above —
+	// every from-role gets a clean handoff so the upstream doesn't
+	// keep this host in its allowlist / peer list.
+	notifyConvertDeparture(cfg, from, "master")
 
 	// Stop the daemon (best-effort). If stop fails, the operator can
 	// retry — config edit hasn't happened yet.

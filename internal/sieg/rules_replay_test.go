@@ -39,7 +39,7 @@ func TestRulesReplay_FindsHistoricalFires(t *testing.T) {
 	}
 
 	// Settle the writer goroutine.
-	time.Sleep(200 * time.Millisecond)
+	s.Flush()
 
 	// Build a rule via the JSON loader (the only public path to
 	// construct an alertRule).
@@ -87,7 +87,7 @@ func TestRulesReplay_TypeFilter(t *testing.T) {
 		s.Write("auth", map[string]any{"event": "auth_failed"})
 		s.Write("network", map[string]any{"event": "auth_failed"})
 	}
-	time.Sleep(200 * time.Millisecond)
+	s.Flush()
 	// Verify both files exist on disk.
 	authPath := filepath.Join(dir, "auth")
 	if _, err := os.Stat(authPath); err != nil {

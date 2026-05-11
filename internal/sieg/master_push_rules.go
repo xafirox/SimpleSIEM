@@ -161,19 +161,12 @@ func (s *serverState) handleMasterPushRules(w http.ResponseWriter, r *http.Reque
 
 // parseRulesBytes is exposed so the master push handler validates
 // rules using the same code path the operator's `rules check`
-// command does. Wraps the existing rules-loading logic.
+// command does. Pure bytes-in path — no temp file — so the file
+// watcher doesn't see a flurry of /tmp/simplesiem-master-push-rules-*
+// create+delete pairs every time MITRE auto-generation walks its
+// curated template list at startup.
 func parseRulesBytes(data []byte) ([]*alertRule, error) {
-	tmp, err := os.CreateTemp("", "simplesiem-master-push-rules-*.json")
-	if err != nil {
-		return nil, err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return nil, err
-	}
-	tmp.Close()
-	return loadRules(tmp.Name())
+	return parseRulesData(data)
 }
 
 // runMasterPushRules is the operator-side fan-out of `simplesiem

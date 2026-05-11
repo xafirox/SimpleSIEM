@@ -5,7 +5,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"syscall"
+	"time"
 )
 
 // safeRenameDir is os.Rename with a copy+remove fallback for the case
@@ -29,9 +31,35 @@ import (
 // permission errors, missing-source errors, etc. surface verbatim
 // without being masked by the copy path.
 func safeRenameDir(src, dst string) error {
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	} else if !isCrossDevice(err) {
+	// Windows-only: retry the rename a few times with short backoff.
+	// MoveFileEx can return ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION /
+	// ERROR_FILE_NOT_FOUND for up to ~1s after a daemon stop while the
+	// kernel finishes flushing handles inside the directory tree. The
+	// retry window is short and bounded so a real "source missing" or
+	// "permission denied" still surfaces in a reasonable time.
+	var err error
+	attempts := 1
+	if runtime.GOOS == "windows" {
+		attempts = 6
+	}
+	for i := 0; i < attempts; i++ {
+		err = os.Rename(src, dst)
+		if err == nil {
+			return nil
+		}
+		// EXDEV must skip the retry loop and go straight to the copy
+		// fallback below — retrying won't help cross-mount renames.
+		if isCrossDevice(err) {
+			break
+		}
+		// On non-Windows or on the last Windows attempt, surface the
+		// error verbatim without paying the retry cost.
+		if i == attempts-1 {
+			break
+		}
+		time.Sleep(time.Duration(200*(i+1)) * time.Millisecond)
+	}
+	if err != nil && !isCrossDevice(err) {
 		return err
 	}
 	if err := copyDirContents(src, dst); err != nil {

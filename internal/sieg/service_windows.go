@@ -103,8 +103,17 @@ func installService(args []string) {
 		// atomicWriteFile + tighter mode still surface intent in the
 		// audit and avoid leaving a partially-written config behind on
 		// installer crashes.
-		if err := atomicWriteFile(cfgFile, []byte(configJSONForMode(chosenMode)), 0o600); err != nil {
+		data := []byte(configJSONForMode(chosenMode))
+		if err := atomicWriteFile(cfgFile, data, 0o600); err != nil {
 			fatalf("write config: %v", err)
+		}
+		// Seed config.json.bak so the malformed-edit recovery path
+		// always has a valid file to roll back to even on a fresh
+		// install. Without this, the s10 user complaint surfaced:
+		// edit config.json with bad JSON, daemon refuses to start,
+		// no .bak to restore from.
+		if err := os.WriteFile(cfgFile+".bak", data, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not seed %s.bak: %v\n", cfgFile, err)
 		}
 		fmt.Println("wrote default config:", cfgFile, "(mode:", chosenMode+")")
 	}
@@ -124,6 +133,14 @@ func installService(args []string) {
 	// operator picking --mode server gets a service that fails to
 	// start until they manually run `certs init`.
 	if chosenMode == "server" {
+		// Set mode explicitly: when install runs over an existing config
+		// (e.g. uninstall -y left a standalone-default config behind),
+		// the file-exists guard above skipped the configJSONForMode
+		// write, so cfg.Mode stays "standalone" without this assignment.
+		if cfg, err := loadConfigStrict(cfgFile); err == nil {
+			cfg.Mode = "server"
+			_ = saveConfig(cfgFile, cfg)
+		}
 		if _, lines, err := ensureServerPKI(cfgFile, 10, 5); err != nil {
 			fatalf("server setup: %v", err)
 		} else {
@@ -168,6 +185,13 @@ func installService(args []string) {
 			fatalf("enrollment failed: %v", err)
 		}
 		cfg, _ := loadConfigStrict(cfgFile)
+		// Set Mode explicitly: when install runs over an existing config
+		// (e.g. uninstall -y left the standalone-default cfg behind, then
+		// install --mode agent re-runs), the file-exists guard above
+		// skipped the configJSONForMode write — without this assignment
+		// the daemon would start in standalone mode with agent certs
+		// configured but no shipping. Mirrors the collector branch above.
+		cfg.Mode = "agent"
 		cfg.Agent.ServerURL = *serverURL
 		if *agentID != "" {
 			cfg.Agent.ID = *agentID
@@ -206,9 +230,106 @@ func installService(args []string) {
 	if err := s.Start(); err != nil {
 		fatalf("start service: %v", err)
 	}
+	// Register Windows Defender Firewall inbound rules for the SimpleSIEM
+	// listener ports. Without this, a fresh server/master install on
+	// Windows binds the listener correctly but every inbound TCP SYN is
+	// silently dropped by the default Windows firewall — exact same
+	// failure mode we hit on Linux when ufw/firewalld weren't opened.
+	// Best-effort: failure prints a warning but the install still
+	// completes; the operator can add the rule manually.
+	ensureWindowsFirewallRules(chosenMode)
+
+	// Enable the Windows audit subcategories that the wevtutil-polling
+	// auth-log layer subscribes to. Default audit policy on Windows
+	// 10/11 client editions doesn't log Security 4720 (user_added),
+	// 4724 (password_reset), 4732 (user_added_to_group), etc. — so
+	// even though wevtutil is polling for them, the events never get
+	// generated. Enabling these subcategories at install time means
+	// `New-LocalUser`, `Add-LocalGroupMember`, etc. (which run as
+	// cmdlets inside an existing powershell.exe and therefore don't
+	// spawn a new process the cmdline parser can see) DO produce
+	// captured events via the audit log path.
+	ensureWindowsAuditPolicy()
+
 	fmt.Println(productName + " installed and started.")
 	fmt.Printf("  binary: %s\n  config: %s\n  logs:   %s\n", destBin, cfgFile, *logDir)
 	fmt.Printf("control: sc.exe start %s | sc.exe stop %s\n", serviceName, serviceName)
+}
+
+// ensureWindowsAuditPolicy turns on the audit subcategories that the
+// wevtutil-polling auth-log layer (`internal/sieg/authlog_windows.go`)
+// expects to see. Default Windows 10/11 client policy logs only Logon
+// events (4624/4625) and leaves Account Management OFF — so local user
+// creation via `New-LocalUser` cmdlets (which don't spawn a new
+// process the cmdline parser can capture) was producing zero events.
+// Best-effort: errors print a warning and don't abort the install.
+//
+// Subcategory GUIDs are stable across Windows versions; using them
+// instead of the localised English subcategory names so this works on
+// non-en-US Windows installs.
+func ensureWindowsAuditPolicy() {
+	// Subcategory GUIDs (Microsoft's canonical IDs):
+	//   {0CCE9235-69AE-11D9-BED3-505054503030} — User Account Management (4720, 4722, 4724, 4726, 4738)
+	//   {0CCE9237-69AE-11D9-BED3-505054503030} — Security Group Management (4727, 4732, 4733, 4734)
+	//   {0CCE9215-69AE-11D9-BED3-505054503030} — Logon (4624)
+	//   {0CCE9217-69AE-11D9-BED3-505054503030} — Logoff (4634)
+	//   {0CCE9216-69AE-11D9-BED3-505054503030} — Account Logon (4768/4769 for AD; harmless on workgroup)
+	subs := []string{
+		"{0CCE9235-69AE-11D9-BED3-505054503030}", // User Account Management
+		"{0CCE9237-69AE-11D9-BED3-505054503030}", // Security Group Management
+		"{0CCE9215-69AE-11D9-BED3-505054503030}", // Logon
+		"{0CCE9217-69AE-11D9-BED3-505054503030}", // Logoff
+	}
+	for _, g := range subs {
+		out, err := exec.Command("auditpol", "/set", "/subcategory:"+g, "/success:enable", "/failure:enable").CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: auditpol enable %s: %v (%s)\n", g, err, strings.TrimSpace(string(out)))
+		}
+	}
+	fmt.Println("  windows audit policy: enabled User/Group Account Management + Logon/Logoff subcategories")
+}
+
+// ensureWindowsFirewallRules adds inbound Windows Defender Firewall
+// rules for the SimpleSIEM listener ports when the install will
+// actually listen (server / master mode). Agents and standalone hosts
+// only make outbound calls, so they don't need an inbound rule.
+//
+// Uses netsh advfirewall (universally present on Windows 10/11/Server
+// 2016+) rather than New-NetFirewallRule (PowerShell-only) so the call
+// works from a plain cmd.exe / Go exec context. Idempotent: existing
+// rules with the same name are deleted first so multiple installs on
+// the same host don't accumulate duplicate entries.
+func ensureWindowsFirewallRules(mode string) {
+	if mode != "server" && mode != "master" {
+		return
+	}
+	rules := []struct {
+		name string
+		port string
+	}{
+		{"SimpleSIEM mTLS (9443/tcp)", "9443"},
+		{"SimpleSIEM network-ingest TLS (6514/tcp)", "6514"},
+	}
+	for _, r := range rules {
+		// Idempotency: drop any existing rule with this name. Errors
+		// here are fine — typically "no rule by that name."
+		_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
+			"name="+r.name).Run()
+		out, err := exec.Command("netsh", "advfirewall", "firewall", "add", "rule",
+			"name="+r.name,
+			"dir=in",
+			"action=allow",
+			"protocol=TCP",
+			"localport="+r.port,
+			"profile=any",
+		).CombinedOutput()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to register Windows Firewall rule %q: %v (%s)\n", r.name, err, strings.TrimSpace(string(out)))
+			fmt.Fprintf(os.Stderr, "  add manually: netsh advfirewall firewall add rule name=%q dir=in action=allow protocol=TCP localport=%s profile=any\n", r.name, r.port)
+		} else {
+			fmt.Printf("  windows firewall: allowed inbound TCP %s (%s)\n", r.port, r.name)
+		}
+	}
 }
 
 // isInstalled reports whether the service is registered with SCM.
@@ -232,6 +353,14 @@ func startCommand(args []string) {
 	_ = fs.Parse(args)
 	cfgFile := filepath.Join(defaultConfigDir(), "config.json")
 	if err := preflightStart(cfgFile); err != nil {
+		// Malformed-config errors get the loud banner (red header,
+		// parse line/col, .bak rollback command). Other preflight
+		// failures (missing certs, unset server_url) keep the
+		// existing single-line "error: preflight: ..." treatment.
+		if _, ok := err.(*configParseError); ok {
+			reportStartupError(err)
+			os.Exit(1)
+		}
 		fatalf("preflight: %v", err)
 	}
 	m, err := mgr.Connect()
@@ -319,6 +448,10 @@ func preflightStart(cfgFile string) error {
 
 func stopCommand(args []string) {
 	fs := flag.NewFlagSet("stop", flag.ExitOnError)
+	// -y is a no-op; same rationale as the unix variant — accept it
+	// for consistency with the rest of the CLI without tripping
+	// flag.ExitOnError when callers forward it through.
+	_ = fs.Bool("y", false, "skip confirmation (no-op; stop is non-interactive)")
 	_ = fs.Parse(args)
 	m, err := mgr.Connect()
 	if err != nil {
@@ -373,6 +506,17 @@ func uninstallService(_ []string) {
 	}
 	if err := s.Delete(); err != nil {
 		fatalf("delete service: %v", err)
+	}
+	// Mirror the install-time firewall rule registration: clean up any
+	// SimpleSIEM rules so a subsequent re-install starts from zero
+	// duplicates and an outright uninstall doesn't leave orphan rules
+	// in Defender Firewall.
+	for _, name := range []string{
+		"SimpleSIEM mTLS (9443/tcp)",
+		"SimpleSIEM network-ingest TLS (6514/tcp)",
+	} {
+		_ = exec.Command("netsh", "advfirewall", "firewall", "delete", "rule",
+			"name="+name).Run()
 	}
 	fmt.Println(productName + " service removed (config and logs preserved)")
 }

@@ -342,6 +342,17 @@ simplesiem triage --pivot-ts 2026-04-30T14:32:00Z --window 5m
 # Filter raw stored events
 simplesiem query --type files --since 1h --grep '/etc/'
 
+# Built-in jq replacement (no external dependency on Linux/Mac/Windows)
+simplesiem query --type auth --since 1h --pretty                         # multi-line indented JSON
+simplesiem query --type auth --since 1h --select event,user,host         # field allowlist
+simplesiem query --type auth --since 1h --grep user_added --get .user    # extract one value (newline-delimited)
+simplesiem query --type files --since 1h --get .path                     # raw value, jq -r '.path' equivalent
+
+# Track everything (a useradd/usermod/passwd will hit one of these)
+simplesiem query --type auth --since 1h --select ts,event,user,actor,source --pretty
+simplesiem query --type files --since 1h --field security_critical=*=credential_store
+simplesiem query --type network --since 1h --select ts,protocol,remote,process,user --grep tool_invocation
+
 # Recent alerts
 simplesiem alerts --since 24h --severity high
 simplesiem alerts --since 24h --unacked-only         # only outstanding triage items
@@ -364,6 +375,16 @@ sudo simplesiem stop
 sudo simplesiem restart                          # stop + start; safe even if stopped
 sudo simplesiem fix                              # audit + repair install
 simplesiem status                                # daemon up, mode, retention, hosts
+
+# Move log_dir (atomic — stops daemon, moves data, updates config, restarts, verifies)
+sudo simplesiem log-dir migrate /new/path -y    # any path outside /etc /usr /boot /efi works
+                                                 # no install rerun needed (Linux post-r4 build)
+
+# Add / remove a watched directory (requires daemon restart to take effect)
+sudo simplesiem watch add /srv/myservice
+sudo simplesiem watch remove /srv/myservice
+sudo simplesiem watch list                       # current file_watch_paths from config
+sudo simplesiem restart                          # required: file_watch_paths is not hot-reloaded
 ```
 
 → [docs/reference.md](reference.md)
@@ -375,23 +396,24 @@ simplesiem status                                # daemon up, mode, retention, h
 ```bash
 # Master-side cross-host correlation rules
 # (master only; pulls events from all servers in master.servers)
-sudo $EDITOR /etc/simplesiem/master-rules.json
-sudo jq '.master.rules_path = "/etc/simplesiem/master-rules.json"' \
-  /etc/simplesiem/config.json | sudo tee /etc/simplesiem/config.json.tmp \
-  && sudo mv /etc/simplesiem/config.json.tmp /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem tune master rules-path /etc/simplesiem/master-rules.json
+# Then build the rules with the stepwise CLI (no JSON to type):
+sudo simplesiem rules new cross-host-failed-logins
+sudo simplesiem rules set cross-host-failed-logins severity high
+sudo simplesiem rules match cross-host-failed-logins type auth
+sudo simplesiem rules match cross-host-failed-logins event ssh_login
+sudo simplesiem rules match cross-host-failed-logins result --any failed,invalid_user
+sudo simplesiem rules threshold cross-host-failed-logins 5 600s user
+sudo simplesiem rules enable cross-host-failed-logins
 
 # Webhook fan-out for alerts
-sudo jq '.server.alert_webhooks = ["https://soc.example.com/hook"] |
-         .server.alert_webhook_min_severity = "high"' \
-  /etc/simplesiem/config.json > /tmp/c && sudo mv /tmp/c /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem alerts-cfg webhook add https://soc.example.com/hook --min-severity high
+sudo simplesiem alerts-cfg webhook list
 
 # RFC 5424 syslog forwarding (Splunk / Elastic / rsyslog pipelines)
-sudo jq '.server.alert_syslog = {network:"udp",address:"syslog.internal:514",
-         facility:16,tag:"simplesiem",severity_min:"high"}' \
-  /etc/simplesiem/config.json > /tmp/c && sudo mv /tmp/c /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem alerts-cfg syslog set udp syslog.internal:514 \
+     --tag simplesiem --min-severity high
+sudo simplesiem alerts-cfg syslog show
 
 # Prometheus scrape (auth-gated; uses any agent client cert OR a bearer token)
 curl -sk --cert /etc/simplesiem/certs/client.pem \
@@ -416,8 +438,9 @@ sudo simplesiem mitre generate-rules --include T1059.001   # un-reject
 ON BY DEFAULT on server / master modes — RFC 5425 TLS listener bound on `:6514` (server) / `:6515` (master) with an auto-generated self-signed cert. Frames that fail allowlist validation are STORED in `<log_dir>/_unauthenticated/syslog/` (not dropped) with `authenticated: false` so investigators see attack attempts. Built-in attack-pattern detector (SQL injection, command injection, Log4Shell, path traversal, XSS, XXE, LDAP, format-string, buffer flood, HTTP-in-syslog, etc.) runs on every frame and tags hits with MITRE ATT&CK technique IDs at `severity: high`. Operator-extensible via `<config>/attack-patterns.json` (hot-reloaded). Every named vendor requires TLS; use `--vendor other` for cleartext-only legacy gear. Full doc: [network-ingest.md](network-ingest.md).
 
 ```bash
-# Print the TLS fingerprint to pin on each device.
-sudo simplesiem query --type meta --grep network_ingest_tls_cert | jq -r .detail
+# Print the TLS fingerprint to pin on each device. Built-in --get
+# replaces `| jq -r .detail` (no jq required on Mac/Windows).
+sudo simplesiem query --type meta --grep network_ingest_tls_cert --get .detail
 
 # Add a device. --vendor is REQUIRED. Use 'other' for unsupported vendors.
 sudo simplesiem network-source add --ip <device-ip> --vendor pfsense --label main-fw
@@ -431,21 +454,88 @@ sudo simplesiem network-source resync                    # pull canonical from a
 sudo simplesiem network-source vendors                   # supported vendor catalog (pfsense, fortigate, cisco_ios, cisco_meraki, sonicwall, ubiquiti, hpe_aruba, other)
 
 # Operator-supplied TLS cert (Let's Encrypt / internal PKI).
-sudo jq '.server.network_ingest.tls_cert_mode = "operator" |
-         .server.network_ingest.tls_cert = "/etc/letsencrypt/live/siem.example.com/fullchain.pem" |
-         .server.network_ingest.tls_key  = "/etc/letsencrypt/live/siem.example.com/privkey.pem"' \
-  /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem network-ingest tls-cert-mode operator
+sudo simplesiem network-ingest tls-cert /etc/letsencrypt/live/siem.example.com/fullchain.pem
+sudo simplesiem network-ingest tls-key  /etc/letsencrypt/live/siem.example.com/privkey.pem
 
 # Add UDP and/or cleartext TCP listeners alongside the default TLS.
-sudo jq '.server.network_ingest.syslog_udp_listen = ":514" |
-         .server.network_ingest.syslog_tcp_listen = ":1514"' \
-  /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem network-ingest udp-listen :514
+sudo simplesiem network-ingest tcp-listen :1514
 
 # Disable network ingest entirely.
-sudo jq '.server.network_ingest.enabled = false' /etc/simplesiem/config.json > /tmp/c.json && sudo mv /tmp/c.json /etc/simplesiem/config.json
-sudo simplesiem restart
+sudo simplesiem network-ingest disable
+
+# Operator-extensible attack-pattern detector (no JSON to type).
+sudo simplesiem attack-patterns new internal-honey
+sudo simplesiem attack-patterns set internal-honey regex 'X-Honey: [A-Z0-9]{16}'
+sudo simplesiem attack-patterns set internal-honey tactic TA0009
+sudo simplesiem attack-patterns set internal-honey technique T1056.001
+sudo simplesiem attack-patterns enable internal-honey
+sudo simplesiem attack-patterns test internal-honey "log line: X-Honey: ABC123DEF4567890"
+```
+
+---
+
+## Detection content (stepwise CLIs — no JSON to type)
+
+The same stepwise pattern (`new` → `set` → `enable`) covers every multi-field
+detection block. Drafts start disabled, every value is validated at the moment
+of the `set`, `enable` audits required fields and refuses on incomplete drafts.
+Atomic write + hot-reload: edits land within ~1 s, no daemon restart.
+
+```bash
+# Threat-intel feeds (cfg.threatintel.feeds[])
+sudo simplesiem threatintel status                     # cache age + indicator counts per feed
+sudo simplesiem threatintel feed list                  # name / kind / state per feed
+sudo simplesiem threatintel feed new abuse-ch          # draft (disabled until enable)
+sudo simplesiem threatintel feed set abuse-ch kind abuse.ch.threatfox
+sudo simplesiem threatintel feed set abuse-ch url https://threatfox-api.abuse.ch/api/v1/
+sudo simplesiem threatintel feed set abuse-ch interval-hours 6
+sudo simplesiem threatintel feed set abuse-ch min-confidence 75
+sudo simplesiem threatintel feed set abuse-ch max-age-days 30
+sudo simplesiem threatintel feed kinds abuse-ch set ip:port,domain,sha256
+sudo simplesiem threatintel feed kinds abuse-ch add url       # add one
+sudo simplesiem threatintel feed kinds abuse-ch remove sha256 # drop one
+sudo simplesiem threatintel feed validate abuse-ch     # dry-run audit
+sudo simplesiem threatintel feed enable abuse-ch       # validate + activate
+sudo simplesiem threatintel feed disable abuse-ch      # keep file entry, stop fetching
+sudo simplesiem threatintel feed delete abuse-ch       # remove from config
+sudo simplesiem tune threatintel max-set-size 100000   # scalar tuning
+sudo simplesiem tune threatintel stale-after-days 7
+sudo simplesiem tune threatintel enabled false         # turn the manager off
+
+# First-seen tuples (cfg.firstseen.tuples[])
+sudo simplesiem firstseen status                       # tuple inventory + entry counts
+sudo simplesiem firstseen tuple list
+sudo simplesiem firstseen tuple add user_country user,geoip.country
+sudo simplesiem firstseen tuple add proc_dir process,path_dir
+sudo simplesiem firstseen tuple fields user_country user,geoip.country,asn   # rewrite
+sudo simplesiem firstseen tuple show user_country
+sudo simplesiem firstseen tuple remove proc_dir
+sudo simplesiem tune firstseen ttl-days 90             # retention cap
+sudo simplesiem tune firstseen max-entries-per-tuple 1000000
+
+# Attack-patterns sidecar (already shown under Network ingest, repeated for cross-reference)
+sudo simplesiem attack-patterns list
+sudo simplesiem attack-patterns disable internal-honey
+sudo simplesiem attack-patterns delete internal-honey
+
+# Cert revoke ↔ unrevoke (no per-peer config-file edits anymore)
+sudo simplesiem certs revoke r1-agent-a                # tombstone propagates via realm sync
+sudo simplesiem certs unrevoke r1-agent-a              # vote to drop the tombstone (this peer)
+sudo simplesiem certs unrevoke list                    # pending intents on this peer
+sudo simplesiem certs unrevoke clear r1-agent-a        # withdraw THIS peer's vote
+# For the tombstone to actually drop, ⌈peers/2⌉+1 peers in the realm must
+# each run `unrevoke <id>` AND the latest intent timestamp must be newer
+# than the original revocation timestamp. Single-server realms quorum on 1 vote.
+
+# Baseline / incidents knobs (scalar tuning)
+sudo simplesiem tune baseline window-days 14
+sudo simplesiem tune baseline stddev-trigger 3.0
+sudo simplesiem tune baseline max-hosts 200
+sudo simplesiem tune baseline reset                    # back to defaults
+sudo simplesiem tune incidents window-seconds 60
+sudo simplesiem tune incidents max-lifetime-seconds 3600
 ```
 
 ---

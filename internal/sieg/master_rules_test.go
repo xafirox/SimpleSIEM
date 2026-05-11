@@ -98,7 +98,7 @@ func TestMasterRules_NonMatchingEventStays_silent(t *testing.T) {
 	s.AddAlertHook(func(a map[string]any) { atomic.AddUint64(&fires, 1) })
 
 	s.EvaluateRules("auth", map[string]any{"event": "auth_success"})
-	time.Sleep(200 * time.Millisecond)
+	s.Flush()
 	if got := atomic.LoadUint64(&fires); got != 0 {
 		t.Errorf("expected 0 fires for non-matching event, got %d", got)
 	}

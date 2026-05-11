@@ -456,9 +456,13 @@ func agentHeartbeatLoop(ctx context.Context, wg *sync.WaitGroup, cfg AgentConfig
 	// On failure, retry every retryEvery (5s by default) until success
 	// instead of waiting the full healthy-state interval. Without this
 	// fast-retry, an outage that ends mid-cycle takes up to a full
-	// reauth_seconds (default 60s) to register as recovered, even though
+	// reauth_seconds (default 15s) to register as recovered, even though
 	// the shipper saw the server come back within seconds.
-	interval := 60 * time.Second
+	// Match the server-side default (15s). The first heartbeat response
+	// will reset this to whatever the server actually advertises, but
+	// keeping the agent's initial interval aligned avoids a 60s cold
+	// gap before the first cadence-aware beat.
+	interval := 15 * time.Second
 	const retryEvery = 5 * time.Second
 	timer := time.NewTimer(5 * time.Second)
 	defer timer.Stop()
@@ -537,6 +541,19 @@ func agentHeartbeatLoop(ctx context.Context, wg *sync.WaitGroup, cfg AgentConfig
 				}
 				healthy = true
 				failureLogged = false
+				// Local visibility: write a meta:agent_heartbeat_sent
+				// row so `triage --grep heartbeat` ON THE AGENT shows
+				// successful beats. Without this, the agent's local
+				// log only carries failures + recoveries and the
+				// operator has no proof beats are happening even
+				// when everything's healthy (the as4 manual-test
+				// failure mode). Server-side logging happens in
+				// recordAgentHeartbeat.
+				log.Write("meta", map[string]any{
+					"event":      "agent_heartbeat_sent",
+					"server_ts":  time.Now().UTC().Format(time.RFC3339Nano),
+					"server_url": cfg.ServerURL,
+				})
 				var hb HeartbeatResponse
 				if err := json.Unmarshal(body, &hb); err == nil {
 					if hb.ReauthSeconds > 0 {
@@ -740,9 +757,65 @@ func (s *serverState) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 			resp.CABundle = bundle
 		}
 	}
+	// Liveness trail: log a meta event under the agent's host dir on
+	// every successful heartbeat. Without this, an operator running
+	// `simplesiem tail --type meta --grep heartbeat` on the server saw
+	// nothing (the receiver only logged failures + recoveries, never
+	// the steady state) and assumed the agent had stopped beating —
+	// this drove the as4 manual-test failure. We log under BOTH the
+	// per-agent dir AND _server/meta so a tail without --host filter
+	// catches the event under whichever root it walks first.
+	//
+	// Bearer-only mode also logs: the agent ID comes from the
+	// X-SimpleSIEM-Host header instead of the cert CN, but the
+	// liveness signal is the same.
+	switch {
+	case cn != "":
+		s.recordAgentHeartbeat(cn, r)
+	case s.allowBearerOnly:
+		if hostID := r.Header.Get("X-SimpleSIEM-Host"); hostID != "" && safeHostName(s.base, hostID) {
+			s.recordAgentHeartbeat(hostID, r)
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
 	out, _ := json.Marshal(resp)
 	_, _ = w.Write(out)
+}
+
+// recordAgentHeartbeat writes a meta:agent_heartbeat under the agent's
+// host directory AND under _server/meta, then bumps the in-memory
+// liveness map used by the hosts-list filter and the silence
+// detector. Called from handleHeartbeat after every gate (allowlist,
+// revocation, identity) has passed, so this only logs genuinely-
+// authorised beats. Dual-write makes the event visible to a server-
+// side `simplesiem tail --type meta --grep heartbeat` regardless of
+// whether the operator is watching the per-host root or the
+// _server pseudo-host root.
+func (s *serverState) recordAgentHeartbeat(cn string, r *http.Request) {
+	remote := remoteIP(r)
+	build := func() map[string]any {
+		// Each Storage's writer goroutine stamps _seq/_prev/_hash on
+		// the event map, so handing the SAME map to two Storage
+		// queues races. Build a fresh copy per recipient.
+		return map[string]any{
+			"event":  "agent_heartbeat",
+			"agent":  cn,
+			"remote": remote,
+			"hint":   "received and authorised at /v1/heartbeat",
+		}
+	}
+	if st, err := s.storageFor(cn); err == nil && st != nil {
+		st.Write("meta", build())
+	}
+	if st, err := s.storageFor("_server"); err == nil && st != nil {
+		st.Write("meta", build())
+	}
+	s.hostLivenessMu.Lock()
+	if s.hostLastSeen == nil {
+		s.hostLastSeen = map[string]time.Time{}
+	}
+	s.hostLastSeen[cn] = time.Now().UTC()
+	s.hostLivenessMu.Unlock()
 }
 
 // handleEnroll signs CSRs presented with a valid PSK. Mounted at
@@ -856,7 +929,7 @@ func (s *serverState) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	tmpl := &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: er.AgentID, Organization: []string{"SimpleSIEM"}},
-		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotBefore:    time.Now().Add(-24 * time.Hour),
 		NotAfter:     time.Now().AddDate(s.enrollClientYears, 0, 0),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
@@ -873,6 +946,18 @@ func (s *serverState) handleEnroll(w http.ResponseWriter, r *http.Request) {
 	// in-memory map so the next /v1/events from this agent isn't
 	// rejected for unknown ID. Idempotent: returning newlyAdded=false
 	// when the ID was already present is a normal re-enrollment flow.
+	// Treat enrollment success as the agent's first liveness signal so
+	// the silence detector starts its 5-minute clock from this moment.
+	// Without it, a freshly-enrolled agent that's stopped before its
+	// first heartbeat (the as7 manual-test scenario) would never trip
+	// the silence alert because hostLastSeen stayed zero.
+	s.hostLivenessMu.Lock()
+	if s.hostLastSeen == nil {
+		s.hostLastSeen = map[string]time.Time{}
+	}
+	s.hostLastSeen[er.AgentID] = time.Now().UTC()
+	s.hostLivenessMu.Unlock()
+
 	added, err := addAgentToAllowlist(s.configPath, er.AgentID)
 	if err != nil {
 		s.broadcastErr("enroll", fmt.Errorf("update allowlist: %v", err))

@@ -81,7 +81,7 @@ func TestCollectorPullState_TransitionEvents(t *testing.T) {
 	collectorMarkSourceState(st, "https://master.example.com:9445", false)
 
 	// Wait for the writer goroutine to flush.
-	time.Sleep(200 * time.Millisecond)
+	st.Flush()
 
 	// Walk the meta dir and count transitions.
 	cfg := Config{Mode: "standalone", LogDir: dir}

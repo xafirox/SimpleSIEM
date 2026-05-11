@@ -39,7 +39,7 @@ func TestRulesStats_AggregatesByRule(t *testing.T) {
 			"matched_event": "modify",
 		})
 	}
-	time.Sleep(200 * time.Millisecond)
+	s.Flush()
 
 	cfg := Config{Mode: "standalone", LogDir: dir}
 	roots := searchRoots(cfg, "")

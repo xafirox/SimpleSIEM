@@ -2,27 +2,71 @@ package sieg
 
 import (
 	"fmt"
+	"os"
+	"sync"
 	"time"
 )
 
-// displayTS returns t in the host's local time zone for human display.
-// Storage, wire format, and on-disk filenames remain UTC; this is purely
-// a formatting hop on the way to the operator's terminal.
+// displayLocOnce caches the resolved display location across the life
+// of the process. SIMPLESIEM_TZ is read once at first display call —
+// changing it mid-process would require a restart, which matches how
+// every other env var the daemon honours behaves.
+var (
+	displayLocOnce sync.Once
+	displayLoc     *time.Location
+)
+
+// resolveDisplayLoc returns the location SimpleSIEM should use for
+// human-facing time display. Priority:
+//  1. SIMPLESIEM_TZ env var (operator override) — accepts any IANA
+//     name like "America/New_York", "Europe/Berlin", or "UTC".
+//  2. time.Local — Go's runtime resolution of the host's local zone
+//     (zoneinfo on Mac/Linux, Windows registry on Windows).
+//
+// The override is the escape hatch for hosts whose system clock runs
+// in UTC (containers, fresh Linux servers, CI). Without it those
+// hosts would display every CLI timestamp in UTC even though the
+// operator reads in their working zone — which is the s7 "alerts is
+// not in local time" report.
+func resolveDisplayLoc() *time.Location {
+	displayLocOnce.Do(func() {
+		if name := os.Getenv("SIMPLESIEM_TZ"); name != "" {
+			if loc, err := time.LoadLocation(name); err == nil {
+				displayLoc = loc
+				return
+			}
+			// Bad SIMPLESIEM_TZ value: print a one-line warning to
+			// stderr and fall back to time.Local. Done once per process
+			// because of sync.Once, so we don't flood the terminal on
+			// every CLI invocation that calls a display helper.
+			fmt.Fprintf(os.Stderr, "warning: SIMPLESIEM_TZ=%q is not a valid IANA zone; falling back to host local time.\n", name)
+		}
+		displayLoc = time.Local
+	})
+	return displayLoc
+}
+
+// displayTS returns t in the configured display zone (SIMPLESIEM_TZ
+// when set, host-local otherwise). Storage, wire format, and on-disk
+// filenames remain UTC; this is purely a formatting hop on the way
+// to the operator's terminal.
 //
 // Cross-platform: time.Local is populated automatically by the Go
 // runtime from the host OS — zoneinfo on macOS/Linux, the Windows
-// registry on Windows — so this works on Mac, Windows, and Linux with
-// no platform-specific code.
-func displayTS(t time.Time) time.Time { return t.In(time.Local) }
+// registry on Windows. Operators on UTC-clocked containers can set
+// SIMPLESIEM_TZ to render everything in their preferred zone.
+func displayTS(t time.Time) time.Time { return t.In(resolveDisplayLoc()) }
 
-// displayTZ returns the short zone abbreviation for the host's local
-// time zone (e.g. "EDT", "PST", "UTC"). Used in CLI headers so the
-// operator can tell at a glance which zone the rendered times belong
-// to. Falls back to a numeric offset like "+05:30" when the runtime
-// can't supply an abbreviation (rare on Windows for certain custom
-// zones).
+// displayTZ returns the short zone abbreviation for the configured
+// display zone (e.g. "EDT", "PST", "UTC"). Used in CLI headers so
+// the operator can tell at a glance which zone the rendered times
+// belong to. Falls back to a numeric offset like "+05:30" when the
+// runtime can't supply an abbreviation (rare on Windows for certain
+// custom zones, common when SIMPLESIEM_TZ points at a fixed-offset
+// zone).
 func displayTZ() string {
-	name, off := time.Now().Zone()
+	loc := resolveDisplayLoc()
+	name, off := time.Now().In(loc).Zone()
 	if name != "" {
 		return name
 	}
@@ -60,8 +104,9 @@ func formatLatest(mtime, now time.Time) string {
 	if mtime.IsZero() {
 		return "-"
 	}
-	local := mtime.In(time.Local)
-	nowLocal := now.In(time.Local)
+	loc := resolveDisplayLoc()
+	local := mtime.In(loc)
+	nowLocal := now.In(loc)
 	ago := humanAgo(now.Sub(mtime))
 	if local.Year() == nowLocal.Year() && local.YearDay() == nowLocal.YearDay() {
 		return fmt.Sprintf("%s (%s ago)", local.Format("15:04:05"), ago)

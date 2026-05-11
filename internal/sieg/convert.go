@@ -125,6 +125,33 @@ func runConvertCmd(args []string) {
 		return
 	}
 
+	// EARLY VALIDATION (before any state mutation): every flag whose
+	// shape we can verify offline must be checked here. A malformed
+	// --realm URL or unparseable PSK previously crashed the convert
+	// AFTER config.json had been flipped to the new mode and AFTER PKI
+	// generation tried (and sometimes failed) to land — the operator
+	// got a half-converted host that simplesiem couldn't recover from
+	// without manual surgery on certs/config. Fail fast with config
+	// untouched is the only safe behaviour.
+	if target == "server" && *realmPeer != "" {
+		u, err := url.Parse(*realmPeer)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			fatalf("--realm URL is malformed (config NOT changed): expected a full URL like https://siem.example.com:9443; got %q", *realmPeer)
+		}
+		if u.Scheme != "https" {
+			fatalf("--realm URL must use https:// (config NOT changed); got %q", *realmPeer)
+		}
+	}
+	if *serverURL != "" {
+		u, err := url.Parse(*serverURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			fatalf("--server URL is malformed (config NOT changed): expected a full URL like https://siem.example.com:9443; got %q", *serverURL)
+		}
+		if u.Scheme != "https" {
+			fatalf("--server URL must use https:// (config NOT changed); got %q", *serverURL)
+		}
+	}
+
 	// as15 — refuse server -> standalone when the realm still has
 	// active dependents AND no other server can take over. The
 	// "dependents" we care about: an agent_allowlist entry whose
@@ -282,6 +309,19 @@ func runConvertCmd(args []string) {
 		stopCommand(nil) // existing helper; logs its own messages
 	}
 
+	// 1b. Notify the previous role's coordinators that we're leaving
+	//     it. Fired BEFORE saveConfig (we still need the live cfg
+	//     fields to resolve who to tell) and BEFORE the daemon is
+	//     stopped (so any TLS material the notifier reads is still
+	//     hot in cache). Best-effort: failures don't block the
+	//     convert. Covers every from-role: agent -> notifyAgentDeparture,
+	//     server -> notifyServerDeparture (replaces the prior
+	//     server->agent-only branch), master and collector for
+	//     completeness even though convert.go only handles the agent /
+	//     server / standalone targets — the helper no-ops when from is
+	//     standalone or matches target.
+	notifyConvertDeparture(cfg, from, target)
+
 	// 2. Rehome standalone-shape log dirs if requested. Only meaningful
 	//    when leaving standalone — otherwise there are no top-level
 	//    log-type dirs to move.
@@ -291,6 +331,25 @@ func runConvertCmd(args []string) {
 		} else if moved > 0 {
 			fmt.Printf("rehomed %d log type(s) to %s/_legacy/ (still readable via 'simplesiem triage --host _legacy ...')\n",
 				moved, cfg.LogDir)
+		}
+	}
+
+	// 2a. For server target: bootstrap server PKI BEFORE writing
+	//     config.json. The PKI step is the one most likely to fail
+	//     (orphaned ca.pem from a previous agent role, filesystem
+	//     permissions on certs dir, etc.) and the operator-visible
+	//     consequence of a partial convert is severe — config flipped
+	//     to server, certs unbootstrapped, daemon won't start, and
+	//     `certs init` would itself trip on the orphan. Doing this
+	//     first means a PKI failure leaves config.json unchanged so
+	//     a retry (or a `certs init` invocation) starts from a
+	//     coherent state. ensureServerPKI handles partial-CA cases
+	//     internally — see internal/sieg/certs.go.
+	var pkiLines []string
+	if target == "server" {
+		var err error
+		if _, pkiLines, err = ensureServerPKI(*cfgPath, 10, 5); err != nil {
+			fatalf("server PKI bootstrap failed (config NOT changed): %v\n  remediation: fix the cert state per the message above and re-run convert", err)
 		}
 	}
 
@@ -355,37 +414,13 @@ func runConvertCmd(args []string) {
 		}
 	}
 
-	// as14 — when converting from server, notify the realm peers so
-	// they drop us from their realm.peers list. Best-effort: a peer
-	// that doesn't answer right now will eventually notice us going
-	// silent, but the explicit signal is cleaner.
-	if from == "server" && target == "agent" {
-		// loadConfig ABOVE before we mutated cfg.Mode held the realm
-		// peer list. Use that view to call /v1/realm/leave on each.
-		// We've already saved the new mode to disk so there's no
-		// rollback path; failures here are pure best-effort.
-		preLeaveCfg := loadConfig(*cfgPath)
-		// We just saved mode=agent — the peer list lives under
-		// cfg.Server.Realm.Peers which is preserved across the save
-		// (server fields aren't cleared on mode flip). notifyServerDeparture
-		// reads the same field.
-		notifyServerDeparture(preLeaveCfg)
-	}
-
-	// 4. For server target: auto-bootstrap the PKI if it isn't already
-	//    there. A server install without certs is non-functional, so
-	//    forcing the operator to run a separate `certs init` afterwards
-	//    is friction with no upside.
-	if target == "server" {
-		if _, lines, err := ensureServerPKI(*cfgPath, 10, 5); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: PKI bootstrap failed: %v\n", err)
-			fmt.Fprintln(os.Stderr, "  fix manually with: sudo simplesiem certs init")
-			wantRunning = false
-		} else {
-			fmt.Println("Server PKI ready:")
-			for _, l := range lines {
-				fmt.Println("  " + l)
-			}
+	// 4. Print PKI bootstrap result (the bootstrap itself ran in step 2a
+	//    BEFORE we touched config.json, so a failure couldn't have
+	//    landed us in a broken half-state).
+	if target == "server" && len(pkiLines) > 0 {
+		fmt.Println("Server PKI ready:")
+		for _, l := range pkiLines {
+			fmt.Println("  " + l)
 		}
 	}
 
@@ -644,16 +679,45 @@ func rehomeLegacyLogs(logDir string) (int, error) {
 // saveConfig writes cfg back to path, preserving the previous file as
 // .bak so a botched edit can be rolled back by hand. Mode is 0640 to
 // match the install-time policy.
+//
+// .bak refresh policy: only copy the existing file to .bak when it
+// parses as valid JSON. If a manual hand-edit broke the JSON and the
+// operator then runs a CLI command (which calls saveConfig), we DON'T
+// want to overwrite the last-known-good .bak with the broken one —
+// that destroys the rollback target. So a malformed existing file
+// leaves the prior .bak alone.
+//
+// Backfill: on installs that pre-date the install-time .bak seeding,
+// the .bak might not exist at all. We backfill it from the current
+// valid file before writing the new config so the rollback target is
+// always present after the FIRST `saveConfig` call.
 func saveConfig(path string, cfg Config) error {
 	if existing, err := os.ReadFile(path); err == nil {
-		_ = os.WriteFile(path+".bak", existing, 0o640)
+		var probe Config
+		if jerr := json.Unmarshal(existing, &probe); jerr == nil {
+			_ = os.WriteFile(path+".bak", existing, 0o640)
+		}
+		// else: existing is malformed; preserve whatever .bak we
+		// already have so a `cp <path>.bak <path>` recovery still
+		// gives the operator a valid file.
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o640)
+	if err := os.WriteFile(path, data, 0o640); err != nil {
+		return err
+	}
+	// Final safety: if the .bak STILL doesn't exist (e.g., the file
+	// existed but was malformed AND no prior .bak ever got written —
+	// possible on installs that pre-date the install-time seeding),
+	// seed it now from the just-written valid config. The operator
+	// then always has a parseable rollback target.
+	if _, err := os.Stat(path + ".bak"); os.IsNotExist(err) {
+		_ = os.WriteFile(path+".bak", data, 0o640)
+	}
+	return nil
 }
 
 // validateAgentReadyForConvert checks that the prospective AgentConfig
