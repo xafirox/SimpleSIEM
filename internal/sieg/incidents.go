@@ -1,7 +1,6 @@
 package sieg
 
 import (
-	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
@@ -183,42 +182,6 @@ func incidentSeverityRank(s string) int {
 func newIncidentID(host string, t time.Time) string {
 	h := sha1.Sum([]byte(host + t.Format(time.RFC3339Nano)))
 	return fmt.Sprintf("inc-%s-%s-%s", t.Format("20060102T150405Z"), host, hex.EncodeToString(h[:4]))
-}
-
-// startIncidentGrouperWatcher periodically flushes the open incident
-// when the window expires (no new alerts coming in).
-func startIncidentGrouperWatcher(ctx context.Context, wg *sync.WaitGroup, g *incidentGrouper) {
-	if g == nil {
-		return
-	}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		t := time.NewTicker(time.Duration(g.cfg.WindowSeconds) * time.Second / 2)
-		if g.cfg.WindowSeconds <= 0 {
-			t = time.NewTicker(30 * time.Second)
-		}
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				g.expireIdle()
-			}
-		}
-	}()
-}
-
-func (g *incidentGrouper) expireIdle() {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	now := time.Now().UTC()
-	for host, inc := range g.open {
-		if now.Sub(inc.LastAlertTS) > time.Duration(g.cfg.WindowSeconds)*time.Second {
-			delete(g.open, host)
-		}
-	}
 }
 
 // runIncidentsCmd dispatches `simplesiem incidents <list|show|config>`.

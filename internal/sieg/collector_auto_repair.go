@@ -182,7 +182,9 @@ func runCollectorQueueRepair(args []string) {
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				fatalf("create state dir: %v", err)
 			}
-			if err := os.WriteFile(path, []byte(strings.TrimSpace(psk)+"\n"), 0o600); err != nil {
+			// atomicWriteFile carries the cross-platform mode contract;
+			// see the parallel comment in runCollectorQueuePromote.
+			if err := atomicWriteFile(path, []byte(strings.TrimSpace(psk)+"\n"), 0o600); err != nil {
 				fatalf("write PSK: %v", err)
 			}
 			fmt.Printf("Realm repair PSK staged at %s.\n", path)

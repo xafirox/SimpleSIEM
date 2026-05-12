@@ -24,7 +24,6 @@ type alertPipeline struct {
 	fixtureKeep      int
 	threatIntel      *threatIntelManager
 	baseline         *baselineDetector
-	mu               sync.Mutex
 }
 
 func newAlertPipeline(cfg Config, logDir string, logger *Storage) *alertPipeline {

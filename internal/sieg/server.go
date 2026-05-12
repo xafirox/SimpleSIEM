@@ -170,6 +170,12 @@ func runServer(ctx context.Context, wg *sync.WaitGroup, cfg Config, cfgPath stri
 	mux.HandleFunc("/v1/master/push/rules", st.handleMasterPushRules)
 	mux.HandleFunc("/v1/master/push/realm-rename", st.handleMasterPushRealmRename)
 	mux.HandleFunc("/v1/master/migrate-server", st.handleMasterMigrateServer)
+	// Master-driven realm-collector directive: invoked by an already-
+	// enrolled master to ask this server to forward a one-shot
+	// instruction to its paired collector via /v1/sync/config (either
+	// adopt-master via a staged PSK, or demote-to-server). mTLS-auth;
+	// caller CN must be in server.master_cns.
+	mux.HandleFunc("/v1/master/collector-directive", st.handleMasterCollectorDirective)
 	mux.HandleFunc("/v1/realm/leave", st.handleRealmLeave)
 	// Remote backup endpoint: invoked by a higher authority (master or
 	// peer server) over mTLS to produce a backup of this server (and

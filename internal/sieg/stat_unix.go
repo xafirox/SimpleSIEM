@@ -35,7 +35,7 @@ func usernameFromUID(uid uint32) string {
 	return name
 }
 
-func addFileStat(rec map[string]any, st os.FileInfo) {
+func addFileStat(rec map[string]any, st os.FileInfo, _ string) {
 	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
 		rec["uid"] = sys.Uid
 		rec["gid"] = sys.Gid

@@ -37,6 +37,23 @@ func startMasterNetworkIngestListener(ctx context.Context, wg *sync.WaitGroup, c
 		// must set SyslogTLSListen.
 		return
 	}
+	// startNetworkIngest also binds the syslog TLS listener to this
+	// same address when NetworkIngest is enabled. Two listeners on one
+	// port collide; the syslog listener loses (raw frames hit the HTTP
+	// mux and 400 out) and unauthenticated meta events never fire.
+	// Skip the master-tier sync listener when the syslog listener owns
+	// the port — the /v1/server/network-allowlist endpoints are
+	// unreachable until a separate sync port is configured, but the
+	// primary syslog ingest works.
+	if cfg.Master.NetworkIngest.Enabled {
+		masterStore.Write("meta", map[string]any{
+			"event":  "master_network_sync_listener_skipped",
+			"reason": "syslog_listener_owns_port",
+			"addr":   addr,
+			"hint":   "syslog ingest takes precedence; the network-allowlist sync endpoints are not bound on this port",
+		})
+		return
+	}
 	tlsCfg, info, err := buildNetworkIngestTLS(cfg, cfg.Master.NetworkIngest)
 	if err != nil {
 		masterStore.Write("errors", map[string]any{

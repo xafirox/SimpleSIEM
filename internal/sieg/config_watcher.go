@@ -4,7 +4,6 @@ import (
 	"context"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -23,8 +22,7 @@ type configWatcher struct {
 	state    *serverState
 	lastSeen int64
 
-	stopOnce sync.Once
-	stop     chan struct{}
+	stop chan struct{}
 }
 
 func newConfigWatcher(cfgPath string, state *serverState) *configWatcher {

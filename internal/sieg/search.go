@@ -58,7 +58,7 @@ func searchRoots(cfg Config, hostFilter string) []searchRoot {
 	mode := normaliseMode(cfg.Mode)
 	locs := allStorageLocations(cfg)
 	switch mode {
-	case "server", "master":
+	case "server", "master", "collector":
 		if hostFilter != "" {
 			out := make([]searchRoot, 0, len(locs))
 			for _, l := range locs {

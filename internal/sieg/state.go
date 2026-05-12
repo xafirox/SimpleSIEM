@@ -78,27 +78,3 @@ type stateNetworkConn struct {
 	Seen   time.Time `json:"seen"`
 }
 
-// stateAuthLog stores the inode + byte offset of the auth.log we were
-// tailing, so on restart we resume from the same position rather than
-// jumping to EOF and missing whatever happened during the downtime.
-type stateAuthLog struct {
-	Path  string `json:"path"`
-	Inode uint64 `json:"inode"`
-	Pos   int64  `json:"pos"`
-}
-
-// stateAuthLogWin stores the highest Security event RecordId we've
-// shipped so the Windows wevtutil poller resumes after a daemon
-// restart instead of replaying the whole Security log.
-type stateAuthLogWin struct {
-	LastRecordID uint64 `json:"last_record_id"`
-}
-
-// stateAuthLogDarwin stores the timestamp of the most recent unified-log
-// entry the macOS authlog collector parsed, so a daemon restart can
-// `log show --start <ts>` to backfill the gap before resuming the
-// `log stream` subprocess. Mirrors the Linux inode+offset checkpoint
-// used by stateAuthLog.
-type stateAuthLogDarwin struct {
-	LastEventTS time.Time `json:"last_event_ts"`
-}

@@ -104,7 +104,10 @@ sudo simplesiem realm rename prod-east
 # Requires server.master_can_rotate_ca: true on each target server.
 sudo simplesiem master realm rename <old-name> prod-east
 
-# Atomic server migration to a different realm — server-driven (no master)
+# Atomic server migration to a different realm — server-driven (no master).
+# Preflight: when the agent allowlist is empty, the migration proceeds
+# even with no other R1 peer alive (nothing to strand). When ≥1 agent is
+# allowlisted, at least one other R1 peer must respond to /v1/health.
 sudo simplesiem realm migrate https://<new-peer>:9443 \
   --key simplesiem-psk:<new-realm-PSK>
 
@@ -130,9 +133,17 @@ sudo simplesiem realm migrate https://<new-peer>:9443 \
 ## Master — pull from servers across realms
 
 ```bash
-# Enroll the master with one server (run for each server you want covered)
+# Enroll the master with one server (run for each server you want covered).
+# After enroll the master probes whether the realm already has its own
+# collector and arbitrates:
+#   - master has no paired collector → auto-adopts (enables :9445 listener,
+#     stages a one-shot PSK on the server, realm collector auto-promotes
+#     within one pull cycle).
+#   - master already has a paired collector → prompts to demote the realm
+#     collector. -y bypasses the prompt; the realm collector logs a
+#     `critical` meta event with the exact follow-up command.
 sudo simplesiem master enroll https://<server-host>:9443 \
-  --key simplesiem-psk:<server-PSK>
+  --key simplesiem-psk:<server-PSK> [-y]
 
 # Status of every registered server (CA timestamp, behind/caught-up)
 simplesiem master rotate-ca-status

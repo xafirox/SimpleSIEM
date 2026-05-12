@@ -643,6 +643,25 @@ type RealmConfig struct {
 	// follow-up CLI command on each migrated server.
 	PendingJoinPeer string `json:"pending_join_peer,omitempty"`
 	PendingJoinPSK  string `json:"pending_join_psk,omitempty"`
+
+	// PendingMasterCollectorPSK is a single-use directive the master
+	// writes during `master enroll` when it wants to adopt the realm's
+	// existing collector. The server surfaces this PSK to its paired
+	// collector via /v1/sync/config (alongside master_url); the
+	// collector stages it at <state>/master_promote.psk and auto-
+	// promotes on its next pull cycle. Cleared after the first
+	// successful surface so a slow-to-poll collector isn't told to
+	// re-promote on every config check.
+	PendingMasterCollectorPSK string `json:"pending_master_collector_psk,omitempty"`
+
+	// PendingCollectorDemote is a single-use directive the master
+	// writes during `master enroll` when it ALREADY has a paired
+	// collector and the realm has its own collector that must yield.
+	// The server surfaces a `collector_demote_to_server` flag via
+	// /v1/sync/config; the collector stops its pull loop, runs the
+	// in-process convert-to-server transition, and restarts as a
+	// peer of this realm. Cleared after first surface.
+	PendingCollectorDemote bool `json:"pending_collector_demote,omitempty"`
 }
 
 // windowsUserProfileWatches returns per-user file watches under C:\Users:

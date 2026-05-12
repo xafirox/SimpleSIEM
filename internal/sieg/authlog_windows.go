@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+// stateAuthLogWin stores the highest Security event RecordId we've
+// shipped so the Windows wevtutil poller resumes after a daemon
+// restart instead of replaying the whole Security log.
+type stateAuthLogWin struct {
+	LastRecordID uint64 `json:"last_record_id"`
+}
+
 // AuthLogCollector on Windows reads the Security event log via the
 // built-in `wevtutil.exe qe Security` subprocess. Polls every
 // auth_log_interval seconds for events with RecordId greater than

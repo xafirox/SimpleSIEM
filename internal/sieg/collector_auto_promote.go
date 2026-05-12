@@ -247,7 +247,12 @@ func runCollectorQueuePromote(args []string) {
 			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 				fatalf("create state dir: %v", err)
 			}
-			if err := os.WriteFile(path, []byte(strings.TrimSpace(psk)+"\n"), 0o600); err != nil {
+			// atomicWriteFile applies the cross-platform mode contract:
+			// 0o600 on unix and a tightened DACL (BUILTIN\Users stripped,
+			// only SYSTEM + Administrators retain access) on Windows.
+			// Plain os.WriteFile ignores mode on Windows and inherits the
+			// parent ACL — which includes Users on C:\ProgramData.
+			if err := atomicWriteFile(path, []byte(strings.TrimSpace(psk)+"\n"), 0o600); err != nil {
 				fatalf("write PSK: %v", err)
 			}
 			fmt.Printf("Master PSK staged at %s.\n", path)

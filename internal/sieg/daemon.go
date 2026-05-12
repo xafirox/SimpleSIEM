@@ -136,11 +136,16 @@ func startDaemon(cfgPath string) (*daemonState, error) {
 	// #9 fixture capture) + background workers (suppression watcher,
 	// MITRE auto-fetch, threat-intel auto-fetch). Standalone mode
 	// always groups its own alerts; no master/server gating applies.
+	//
+	// Order matters: startSiemEnhancements assigns pipeline.threatIntel
+	// and pipeline.baseline. Register the alert hook AFTER those writes
+	// complete so no early alert fires concurrent with the assignment
+	// (data race on the bare pointer fields).
 	pipeline := newAlertPipeline(cfg, cfg.LogDir, storage)
+	startSiemEnhancements(ctx, &wg, cfg, storage, pipeline)
 	if pipeline != nil {
 		storage.AddAlertHook(pipeline.hook)
 	}
-	startSiemEnhancements(ctx, &wg, cfg, storage, pipeline)
 
 	if cfg.Server.NetworkIngest.Enabled || cfg.Master.NetworkIngest.Enabled {
 		storage.Write("meta", map[string]any{

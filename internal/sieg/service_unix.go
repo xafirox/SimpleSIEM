@@ -225,6 +225,25 @@ func installService(args []string) {
 			fatalf("--realm-key given without --realm; both are required for one-shot realm join")
 		}
 	}
+	if *mode == "master" {
+		// Set mode explicitly when install runs over an existing config.
+		if cfg, err := loadConfigStrict(cfgFile); err == nil {
+			cfg.Mode = "master"
+			_ = saveConfig(cfgFile, cfg)
+		}
+		// Auto-generate the master's enrollment PSK now so collectors
+		// can pair against this host without the operator needing to
+		// run a separate `simplesiem certs psk rotate`. The previous
+		// behaviour produced a confusing "open /var/lib/simplesiem/state/enroll.psk:
+		// no such file or directory" error on the first `certs psk show`
+		// after install, even though the operator never had a chance to
+		// create one.
+		if psk, err := generateEnrollPSK(false); err == nil {
+			fmt.Println()
+			fmt.Printf("Master enrollment PSK: %s\n", psk)
+			fmt.Println("  Use with: simplesiem install --mode collector --master https://<this>:9443 --master-key <PSK>")
+		}
+	}
 	if *mode == "collector" {
 		// Preflight already ran above (BEFORE any filesystem
 		// mutation); proceed straight to the enrollment dance.

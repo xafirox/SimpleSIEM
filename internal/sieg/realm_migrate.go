@@ -153,9 +153,19 @@ func runRealmMigrate(args []string) {
 	r1Peers := append([]string{}, cfg.Server.Realm.Peers...)
 
 	// Step 2: preflight. Skipped under --force.
+	//
+	// The preflight gates on AGENT presence: if no agents are currently
+	// authorised to ship to this server, the migration is safe even with
+	// zero R1 peers — nothing depends on this server staying in R1. If
+	// agents ARE present, we require at least one OTHER R1 peer so
+	// agents' failover_servers list has somewhere to land after we
+	// leave. Either condition can be bypassed with --force.
+	agentCount := len(cfg.Server.AgentAllowlist)
 	if !*force {
-		if err := preflightAtLeastOneR1PeerOnline(cfg, r1Peers); err != nil {
-			fatalf("preflight: %v\n  pass --force if remaining R1 peers are decommissioned and you accept agent shipping disruption.", err)
+		if agentCount > 0 {
+			if err := preflightAtLeastOneR1PeerOnline(cfg, r1Peers); err != nil {
+				fatalf("preflight: %d agent(s) currently allowlisted, but %v\n  options:\n    - uninstall the agent(s) (sudo simplesiem uninstall on each agent host) and retry\n    - bring up a peer server in this realm so agents have a failover target\n    - pass --force if remaining R1 peers are decommissioned and you accept agent shipping disruption.", agentCount, err)
+			}
 		}
 		if err := preflightR2Reachable(r2URL); err != nil {
 			fatalf("preflight: destination peer %s is not reachable: %v\n  fix the URL or pass --force after verifying connectivity manually.", r2URL, err)
@@ -166,6 +176,9 @@ func runRealmMigrate(args []string) {
 		fmt.Fprintln(os.Stderr, "  Agents currently shipping to this server will see failures until they")
 		fmt.Fprintln(os.Stderr, "  switch to a peer that's still in the original realm. If no peer remains,")
 		fmt.Fprintln(os.Stderr, "  agent events will spool until the operator re-enrolls them.")
+	}
+	if !*force && agentCount == 0 {
+		fmt.Println("Preflight: 0 agents allowlisted — peer-count check skipped (safe to migrate).")
 	}
 
 	if !*yes && !*force {
@@ -192,10 +205,18 @@ func runRealmMigrate(args []string) {
 	notified, failedPeers := notifyR1PeersOfDeparture(cfg, r1Peers, selfID)
 	fmt.Printf("Notified %d/%d R1 peer(s) of departure.\n", notified, len(r1Peers))
 	if len(failedPeers) > 0 {
-		if !*force {
+		// Same agent-conditional relaxation as the preflight: when no
+		// agents are allowlisted on the migrating server, an unreachable
+		// R1 peer can't strand anyone. We proceed without --force and
+		// surface a warning so the operator sees the partial notify.
+		switch {
+		case agentCount == 0 && !*force:
+			fmt.Fprintf(os.Stderr, "  warning: %d peer(s) could not be notified (%v); proceeding because 0 agents are allowlisted (nothing to strand).\n", len(failedPeers), failedPeers)
+		case *force:
+			fmt.Fprintf(os.Stderr, "  warning: %d peer(s) could not be notified (%v); proceeding under --force.\n", len(failedPeers), failedPeers)
+		default:
 			fatalf("could not notify these R1 peers: %v\n  re-run with --force if they're known-down; the migration will continue without acknowledgement.", failedPeers)
 		}
-		fmt.Fprintf(os.Stderr, "  warning: %d peer(s) could not be notified (%v); proceeding under --force.\n", len(failedPeers), failedPeers)
 	}
 
 	// Step 5: clear local R1 state.

@@ -159,6 +159,19 @@ func installService(args []string) {
 			fatalf("--realm-key given without --realm; both are required for one-shot realm join")
 		}
 	}
+	if chosenMode == "master" {
+		if cfg, err := loadConfigStrict(cfgFile); err == nil {
+			cfg.Mode = "master"
+			_ = saveConfig(cfgFile, cfg)
+		}
+		// Auto-generate the master's enrollment PSK at install so
+		// collectors can pair without a separate `certs psk rotate`.
+		if psk, err := generateEnrollPSK(false); err == nil {
+			fmt.Println()
+			fmt.Printf("Master enrollment PSK: %s\n", psk)
+			fmt.Println("  Use with: simplesiem install --mode collector --master https://<this>:9443 --master-key <PSK>")
+		}
+	}
 	if chosenMode == "collector" {
 		// Preflight already ran above (BEFORE any filesystem
 		// mutation); proceed straight to the enrollment dance.

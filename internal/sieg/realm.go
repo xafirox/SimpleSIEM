@@ -255,6 +255,36 @@ func (s *serverState) handleSyncConfig(w http.ResponseWriter, r *http.Request) {
 			"pull_interval_seconds": cfgNow.Master.CollectorPushConfig.PullIntervalSeconds,
 		}
 	}
+	// collector_cn — surface the server's currently-paired collector CN
+	// so an enrolling master can detect existing collector pairings
+	// during `master enroll` and decide whether to adopt the realm
+	// collector (master has no slot taken) or direct it to demote
+	// (master already has its own collector).
+	if cfgNow.Server.CollectorCN != "" {
+		resp["collector_cn"] = cfgNow.Server.CollectorCN
+	}
+	// Pending master→collector directives. Surface only when the caller
+	// IS the paired collector (mTLS peer CN matches Server.CollectorCN)
+	// — masters / peer servers seeing a directive bound for someone
+	// else would be a leak. The directive is single-use: clear it after
+	// inclusion so a slow-to-poll collector isn't re-told on every tick.
+	if cfgNow.Server.CollectorCN != "" && r.TLS != nil && len(r.TLS.PeerCertificates) > 0 {
+		callerCN := r.TLS.PeerCertificates[0].Subject.CommonName
+		if callerCN == cfgNow.Server.CollectorCN {
+			emitted := false
+			if cfgNow.Server.Realm.PendingMasterCollectorPSK != "" {
+				resp["master_collector_psk"] = cfgNow.Server.Realm.PendingMasterCollectorPSK
+				emitted = true
+			}
+			if cfgNow.Server.Realm.PendingCollectorDemote {
+				resp["collector_demote_to_server"] = true
+				emitted = true
+			}
+			if emitted {
+				_ = clearRealmPendingCollectorDirective(s.configPath)
+			}
+		}
+	}
 	// ca_bundle surfaces the source's full trusted-CA bundle (current
 	// + legacy) so a paired collector can detect a CA rotation and
 	// refresh its on-disk ca.pem proactively, closing the gap where
@@ -933,6 +963,17 @@ type MasterEnrollRequest struct {
 	MasterID  string `json:"master_id"`
 	CSRPem    string `json:"csr_pem"`
 	MasterURL string `json:"master_url,omitempty"`
+
+	// MasterCollectorPSK + DemoteCollectorToServer drive the master's
+	// "join realm and re-organise the collector" logic (see master.go's
+	// runMasterEnroll). Exactly zero or one of them is non-zero per
+	// enrollment request — the master sets MasterCollectorPSK when its
+	// own collector slot is empty AND the realm has a collector (so the
+	// realm collector should adopt the master); it sets
+	// DemoteCollectorToServer when its slot is already taken AND the
+	// realm has a collector (so the realm collector must yield).
+	MasterCollectorPSK      string `json:"master_collector_psk,omitempty"`
+	DemoteCollectorToServer bool   `json:"demote_collector_to_server,omitempty"`
 }
 
 // MasterEnrollResponse mirrors EnrollResponse but adds RealmName so
@@ -1050,6 +1091,13 @@ func (s *serverState) handleEnrollMaster(w http.ResponseWriter, r *http.Request)
 		}
 		_ = setRealmMasterURL(s.configPath, er.MasterURL)
 	}
+	// Master's "join realm and re-organise the collector" directives.
+	// At most one of these is set per request; the master fills exactly
+	// one based on whether its own collector slot is empty (PSK path)
+	// or taken (demote path).
+	if er.MasterCollectorPSK != "" || er.DemoteCollectorToServer {
+		_ = setRealmPendingCollectorDirective(s.configPath, er.MasterCollectorPSK, er.DemoteCollectorToServer)
+	}
 	s.masterMu.Lock()
 	if !contains(s.masterCNs, er.MasterID) {
 		s.masterCNs = append(s.masterCNs, er.MasterID)
@@ -1125,6 +1173,85 @@ func validateMasterListenerURL(s string) error {
 	return nil
 }
 
+// CollectorDirectiveRequest is the body of POST /v1/master/collector-directive.
+// Used by an already-enrolled master to forward one-shot instructions
+// to the server's paired collector. Exactly one of MasterCollectorPSK
+// or DemoteToServer should be set per call. MasterURL is required when
+// MasterCollectorPSK is set — the auto-promote path on the collector
+// dials this URL to re-enrol with the master.
+type CollectorDirectiveRequest struct {
+	MasterCollectorPSK string `json:"master_collector_psk,omitempty"`
+	DemoteToServer     bool   `json:"demote_to_server,omitempty"`
+	MasterURL          string `json:"master_url,omitempty"`
+}
+
+// handleMasterCollectorDirective records a single-use directive that
+// /v1/sync/config will surface to the paired collector on its next
+// poll. mTLS-authenticated: caller CN must be in server.master_cns,
+// otherwise 403. Refuses if the server has no paired collector
+// (nothing for the directive to target).
+func (s *serverState) handleMasterCollectorDirective(w http.ResponseWriter, r *http.Request) {
+	addSecurityHeaders(w)
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		http.Error(w, "mTLS required", http.StatusUnauthorized)
+		return
+	}
+	cn := r.TLS.PeerCertificates[0].Subject.CommonName
+	s.masterMu.RLock()
+	authed := false
+	for _, m := range s.masterCNs {
+		if m == cn {
+			authed = true
+			break
+		}
+	}
+	s.masterMu.RUnlock()
+	if !authed {
+		s.logAuthFailure(r, "master/collector-directive")
+		http.Error(w, "not a recognised master", http.StatusForbidden)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 64*1024))
+	if err != nil {
+		http.Error(w, "read body", http.StatusBadRequest)
+		return
+	}
+	var req CollectorDirectiveRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	cfgNow := loadConfig(s.configPath)
+	if cfgNow.Server.CollectorCN == "" {
+		http.Error(w, "this server has no paired collector — no target for the directive", http.StatusConflict)
+		return
+	}
+	if req.MasterCollectorPSK == "" && !req.DemoteToServer {
+		http.Error(w, "directive is empty (set master_collector_psk OR demote_to_server)", http.StatusBadRequest)
+		return
+	}
+	// Persist the directive itself. The PSK adopt path additionally
+	// requires the server to advertise the master_url so the collector
+	// knows where to dial; record it via the same setter used by the
+	// enroll-master path so a server reboot keeps the URL in sync.
+	if err := setRealmPendingCollectorDirective(s.configPath, req.MasterCollectorPSK, req.DemoteToServer); err != nil {
+		http.Error(w, "persist directive: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if req.MasterURL != "" && req.MasterCollectorPSK != "" {
+		if perr := validateMasterListenerURL(req.MasterURL); perr != nil {
+			http.Error(w, "invalid master_url: "+perr.Error(), http.StatusBadRequest)
+			return
+		}
+		_ = setRealmMasterURL(s.configPath, req.MasterURL)
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // setRealmMasterURL records the master's collector-listener URL so
 // /v1/sync/config can advertise it to paired collectors. Idempotent.
 func setRealmMasterURL(cfgPath, masterURL string) error {
@@ -1135,6 +1262,37 @@ func setRealmMasterURL(cfgPath, masterURL string) error {
 		return nil
 	}
 	cfg.Server.Realm.MasterURL = masterURL
+	return saveConfig(cfgPath, cfg)
+}
+
+// setRealmPendingCollectorDirective queues a single-use directive for
+// the server's paired collector to act on at its next /v1/sync/config
+// poll. Exactly one of `promotePSK` / `demote` should be non-zero per
+// call (the master fills one based on whether it has its own collector
+// already). Both being set is tolerated — the demote takes precedence
+// at delivery time because the realm's collector must yield first
+// before any other change makes sense.
+func setRealmPendingCollectorDirective(cfgPath, promotePSK string, demote bool) error {
+	allowlistEditMu.Lock()
+	defer allowlistEditMu.Unlock()
+	cfg := loadConfig(cfgPath)
+	cfg.Server.Realm.PendingMasterCollectorPSK = strings.TrimSpace(promotePSK)
+	cfg.Server.Realm.PendingCollectorDemote = demote
+	return saveConfig(cfgPath, cfg)
+}
+
+// clearRealmPendingCollectorDirective wipes the single-use directive
+// after the paired collector has been notified once via /v1/sync/config.
+// Safe to call when nothing is pending (no-op).
+func clearRealmPendingCollectorDirective(cfgPath string) error {
+	allowlistEditMu.Lock()
+	defer allowlistEditMu.Unlock()
+	cfg := loadConfig(cfgPath)
+	if cfg.Server.Realm.PendingMasterCollectorPSK == "" && !cfg.Server.Realm.PendingCollectorDemote {
+		return nil
+	}
+	cfg.Server.Realm.PendingMasterCollectorPSK = ""
+	cfg.Server.Realm.PendingCollectorDemote = false
 	return saveConfig(cfgPath, cfg)
 }
 

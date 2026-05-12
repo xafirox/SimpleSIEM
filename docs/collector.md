@@ -186,6 +186,17 @@ If the collector's master / server has been unreachable for a configurable thres
 
 A `meta:collector_query_failsafe_on` / `..._off` event marks each transition.
 
+## Master-driven directives via /v1/sync/config
+
+A paired collector can receive two one-shot directives from a master that has just enrolled into its realm. Both flow through the existing `/v1/sync/config` pull cycle so the collector picks them up without an operator step on the collector host.
+
+| Directive (sync/config field) | Trigger on master | What the collector does |
+|---|---|---|
+| `master_collector_psk` (string) | `master enroll` when the master has **no** paired collector and the realm **has** one. The master auto-enables its collector listener and POSTs the listener's PSK to the server's `/v1/master/collector-directive`; the server stores it in `realm.pending_master_collector_psk` and surfaces it once. | Writes the PSK to `<state>/master_promote.psk` (mode `0600` on unix; `Users`-stripped DACL on Windows), then the existing `r21` auto-promote loop re-pairs the collector with the new master URL on its next pull cycle. Emits `meta:collector_master_promote_psk_received`. |
+| `collector_demote_to_server` (bool) | `master enroll` when the master **already** has a paired collector and the realm also has one. The CLI prompts `Continue? [y/N]`; `-y` skips. On confirmation the master POSTs `demote_to_server: true` to the server; the server surfaces the flag once. | Stages `<state>/pending_demote_to_server` (mode `0600`) and emits a `critical`-severity `meta:collector_master_demote_directive` event with the exact follow-up command (`convert standalone -y && convert server -y --realm <peer> --realm-key <PSK>`). The conversion itself is operator-driven: stop, demote, join the realm as a peer. |
+
+Both directives are **single-use**: the server clears them right after the first delivery so a slow-to-poll collector isn't re-told on every config cycle. The collector emits the corresponding meta event so `simplesiem alerts` / `query --type meta` show the audit trail.
+
 ## Master querying the collector's archive
 
 The master can pull historical events from the collector's longer-tail retention without touching its own (smaller) tail. Pair via the collector's optional master-query listener:

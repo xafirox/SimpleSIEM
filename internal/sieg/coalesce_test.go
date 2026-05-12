@@ -28,14 +28,6 @@ func captureStdout(t *testing.T, fn func()) string {
 	return <-done
 }
 
-func mkFileEvent(ts time.Time, path, ev string) Event {
-	return Event{
-		TS:   ts,
-		Type: "files",
-		Data: map[string]any{"event": ev, "path": path, "user": "root"},
-	}
-}
-
 // TestPrintTriageMulti_CoalescesConsecutiveDuplicates writes events to
 // a temp dir, then runs printTriageMulti and asserts:
 //   - 50 identical "modified" events become one line with "(×50 over ...)"

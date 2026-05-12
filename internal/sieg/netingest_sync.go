@@ -161,7 +161,6 @@ type pendingPushDispatcher struct {
 	cfg   Config
 	store *networkAllowlist
 	stop  chan struct{}
-	wg    sync.WaitGroup
 }
 
 func newPendingPushDispatcher(cfg Config, store *networkAllowlist) *pendingPushDispatcher {

@@ -34,10 +34,9 @@ type firstSeenDetector struct {
 	// logger is the global _server / _master / standalone meta store
 	// (always set). The per-host store lookup goes through onWrite,
 	// which is wired by the server when it owns the per-host storages.
-	logger   *Storage
-	onWrite  func(host string, fields map[string]any)
-	dirty    bool
-	saveTick *time.Ticker
+	logger  *Storage
+	onWrite func(host string, fields map[string]any)
+	dirty   bool
 }
 
 // firstSeenFields names the event fields we track. Operators can't

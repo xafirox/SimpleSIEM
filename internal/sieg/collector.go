@@ -139,13 +139,21 @@ func startCollectorDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (
 	return &daemonState{storage: collectorStore}, nil
 }
 
-// effectivePullInterval picks the configured interval (defaulting
-// to one day) and returns it in seconds.
+// effectivePullInterval picks the configured interval (defaulting to
+// 60s) and returns it in seconds. Previously this defaulted to 86400
+// (1 day), which made a freshly-paired collector dormant for 24 hours
+// before any pull / failsafe / push event surfaced — operators saw a
+// "running but inert" daemon for a day with no signal. 60 seconds is
+// tight enough that the failsafe transition + collector pull cadence
+// becomes observable immediately after pairing, loose enough that
+// pull traffic doesn't dominate the wire on a quiet realm. Operators
+// can override via `simplesiem master collector push-interval` (master
+// pushes the override down) or by direct config edit on the collector.
 func effectivePullInterval(cfg Config) int {
 	if cfg.Collector.PullIntervalSeconds > 0 {
 		return cfg.Collector.PullIntervalSeconds
 	}
-	return 86400
+	return 60
 }
 
 // collectorCertsDir returns the per-source cert root.
@@ -464,6 +472,24 @@ func checkAuthorityAndConfig(ctx context.Context, client *http.Client, source st
 	// pre-staged a PSK at <state>/master_promote.psk, the collector
 	// promotes itself in-process and consumes the PSK file.
 	if mu, _ := pc["master_url"].(string); mu != "" && mu != source {
+		// Master-driven directive: when the master enrolled into this
+		// realm and there was no existing collector pairing on the
+		// master, the server now carries a one-shot
+		// `master_collector_psk` for the realm's existing collector
+		// to use as it adopts the master. Stage it before invoking
+		// the auto-promote helper so the file is in place at the
+		// moment auto-promote checks for it.
+		if psk, ok := pc["master_collector_psk"].(string); ok && strings.HasPrefix(strings.TrimSpace(psk), enrollPSKPrefix) {
+			if err := os.MkdirAll(filepath.Dir(collectorAutoPromotePSKPath()), 0o700); err == nil {
+				if werr := atomicWriteFile(collectorAutoPromotePSKPath(), []byte(strings.TrimSpace(psk)+"\n"), 0o600); werr == nil {
+					storage.Write("meta", map[string]any{
+						"event":      "collector_master_promote_psk_received",
+						"hint":       "source forwarded a master-collector PSK; staged at master_promote.psk for the auto-promote loop",
+						"master_url": mu,
+					})
+				}
+			}
+		}
 		storage.Write("meta", map[string]any{
 			"event":      "collector_authority_promotion_available",
 			"current":    source,
@@ -473,6 +499,26 @@ func checkAuthorityAndConfig(ctx context.Context, client *http.Client, source st
 		// r21 — auto-promote opportunistically when the operator has
 		// pre-staged the PSK. Errors are logged inside the helper.
 		_, _ = tryCollectorAutoPromote(cfg, defaultConfigPath(), mu, storage)
+	}
+	// Master-driven demote directive: master had its own collector
+	// already, so the realm's existing collector must yield. The
+	// directive is rare and destructive — flipping a collector to a
+	// server entails wiping the collector's source pairing and
+	// initialising fresh server-side PKI, which is too disruptive to
+	// run silently on a pull tick. Surface a critical meta event +
+	// stage a sentinel file the operator (or a follow-up daemon
+	// transition) can pick up; the operator finishes with one CLI
+	// invocation.
+	if demote, _ := pc["collector_demote_to_server"].(bool); demote {
+		stagePath := filepath.Join(defaultStateDir(), "pending_demote_to_server")
+		_ = os.MkdirAll(filepath.Dir(stagePath), 0o700)
+		_ = atomicWriteFile(stagePath, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600)
+		storage.Write("meta", map[string]any{
+			"event":    "collector_master_demote_directive",
+			"severity": "critical",
+			"source":   source,
+			"hint":     "the master that enrolled into this realm already has its own collector. To finish the directive (convert this host from collector to server, then join the realm as a peer), run:  sudo simplesiem convert standalone -y && sudo simplesiem convert server -y --realm <one-of-the-realm-peers> --realm-key <PSK-from-that-peer>",
+		})
 	}
 	// Master-pushed config: adopt new pull interval if changed.
 	if push, ok := pc["collector_push_config"].(map[string]any); ok {

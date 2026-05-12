@@ -101,6 +101,18 @@ When the master enrolls with one server in a realm, the master automatically lea
 
 **Security note**: auto-discovery widens the blast radius of a leaked PSK. With it, one PSK reaches every server in the realm via the propagated `master_cns`. For high-security environments where each server should only trust an explicitly-enrolled master, see [FutureImprovements.md](../FutureImprovements.md) — an opt-out flag (`server.master_auto_discover_peers`) is the planned mitigation.
 
+### Collector arbitration on enroll
+
+`master enroll` also probes whether the realm being joined already has its own paired collector (the server returns `collector_cn` in `/v1/sync/config`). Two outcomes:
+
+| Master state before enroll | Realm has a collector? | What happens |
+|---|---|---|
+| `master.collector_cn` empty | Yes | **Auto-adopt.** The master auto-enables its collector listener (`master collector enable --listen :9445`), bootstraps its own CA + server cert + collector PSK, and POSTs the PSK to the server's `/v1/master/collector-directive` endpoint. The server stages the PSK in `realm.pending_master_collector_psk` and surfaces it once via `/v1/sync/config` to its paired collector. The collector writes the PSK to `<state>/master_promote.psk` and the existing `r21` auto-promote loop re-pairs it with the master on its next pull cycle (≤ 60 s by default; ≤ 5 s when push-interval is tuned down). |
+| `master.collector_cn` set | Yes | **Demote prompt.** The master prompts `Continue? [y/N]` (or `-y` skips); on confirmation the master POSTs `demote_to_server: true` to the server, the server surfaces `collector_demote_to_server` once via `/v1/sync/config`, and the realm collector logs a `critical`-severity `collector_master_demote_directive` meta event with the exact follow-up command (`convert standalone -y && convert server -y --realm <peer> --realm-key <PSK>`). The single-collector-per-master rule is preserved — the master keeps its own collector and the realm collector yields. |
+| Either | No | No action taken — master enroll exits with the standard "enrolled with <server-url>" summary. |
+
+The collector listener PSK auto-created in the adopt case is stored at `<state>/master_collector_enroll.psk` mode `0600`; subsequent operator invocations of `master collector show-psk` read the same file.
+
 ### 4. Verify
 
 ```

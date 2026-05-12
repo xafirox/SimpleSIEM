@@ -633,6 +633,10 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(tmp)
 		return err
 	}
+	// Windows ignores POSIX mode in os.WriteFile — apply equivalent
+	// DACL tightening for files written with "world-unreadable" intent
+	// (0o640, 0o600, etc.). No-op on Linux/macOS.
+	applyFileMode(path, mode)
 	return nil
 }
 

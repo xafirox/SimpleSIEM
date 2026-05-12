@@ -1454,7 +1454,7 @@ func (c *FileCollector) loop(ctx context.Context) {
 			if st, err := os.Stat(ev.Name); err == nil {
 				rec["size"] = st.Size()
 				rec["mode"] = fmt.Sprintf("%o", st.Mode())
-				addFileStat(rec, st)
+				addFileStat(rec, st, ev.Name)
 				// SHA-384 of file content on create/modify, capped at
 				// 16 MiB so we don't block the watcher hashing a 5 GB
 				// log. Hash failures (file deleted before we open,

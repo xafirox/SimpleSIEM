@@ -2,8 +2,6 @@
 
 package sieg
 
-import "sync"
-
 // icmpCounters is the cross-platform stub. Linux populates real
 // values from /proc/net/snmp (see icmp_linux.go); Mac and Windows
 // have no equivalent counter file, so the deltas always read as
@@ -19,9 +17,7 @@ type icmpCounters struct {
 	OutEchoReps int64
 }
 
-type icmpDeltaTracker struct {
-	mu sync.Mutex
-}
+type icmpDeltaTracker struct{}
 
 func (t *icmpDeltaTracker) snapshotDelta() (icmpCounters, icmpCounters) {
 	return icmpCounters{}, icmpCounters{}

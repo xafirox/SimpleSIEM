@@ -1032,8 +1032,12 @@ func runMasterCollectorPushInterval(args []string) {
 	if err != nil {
 		fatalf("invalid duration: %v", err)
 	}
-	if d < time.Minute {
-		fatalf("interval must be >= 1m")
+	// 5s floor: tight enough to make `query --failsafe` transitions observable
+	// in 30–45s test windows, loose enough to keep pull traffic reasonable.
+	// Operators wanting realm-wide near-real-time replication tune this
+	// alongside `tune master sync-interval`.
+	if d < 5*time.Second {
+		fatalf("interval must be >= 5s")
 	}
 	allowlistEditMu.Lock()
 	defer allowlistEditMu.Unlock()

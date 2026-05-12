@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+// stateAuthLogDarwin stores the timestamp of the most recent unified-log
+// entry the macOS authlog collector parsed, so a daemon restart can
+// `log show --start <ts>` to backfill the gap before resuming the
+// `log stream` subprocess. Mirrors the Linux inode+offset checkpoint
+// used by stateAuthLog.
+type stateAuthLogDarwin struct {
+	LastEventTS time.Time `json:"last_event_ts"`
+}
+
 // AuthLogCollector on macOS subprocesses `log stream --style ndjson` and
 // parses the unified-logging entries for sshd, sudo, and su events. macOS
 // retired plain-text auth files years ago — /var/log/auth.log doesn't

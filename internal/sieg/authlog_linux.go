@@ -13,6 +13,15 @@ import (
 	"time"
 )
 
+// stateAuthLog stores the inode + byte offset of the auth.log we were
+// tailing, so on restart we resume from the same position rather than
+// jumping to EOF and missing whatever happened during the downtime.
+type stateAuthLog struct {
+	Path  string `json:"path"`
+	Inode uint64 `json:"inode"`
+	Pos   int64  `json:"pos"`
+}
+
 // AuthLogCollector tails the system auth log (sshd, sudo, su, pam) and emits
 // one structured event per recognised line. It complements the gopsutil-based
 // AuthCollector, which only sees logged-in *sessions* — failed SSH attempts

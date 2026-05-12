@@ -130,11 +130,16 @@ func startMasterDaemon(ctx context.Context, wg *sync.WaitGroup, cfg Config) (*da
 	// SIEM-enhancement pipeline + background workers (#1, #2, #6,
 	// #8, #9 + threat-intel). Master is the canonical authority
 	// when present, so its grouper IS authoritative by default.
+	//
+	// Order matters: startSiemEnhancements assigns pipeline.threatIntel
+	// and pipeline.baseline; the alert hook reads those fields. Register
+	// the hook AFTER the assignments so an early alert can't race the
+	// write.
 	masterPipeline := newAlertPipeline(cfg, cfg.LogDir, masterStore)
+	startSiemEnhancements(ctx, wg, cfg, masterStore, masterPipeline)
 	if masterPipeline != nil {
 		masterStore.AddAlertHook(masterPipeline.hook)
 	}
-	startSiemEnhancements(ctx, wg, cfg, masterStore, masterPipeline)
 
 	masterStore.Write("meta", map[string]any{
 		"event":    "start",
@@ -661,6 +666,10 @@ func runMasterEnroll(args []string) {
 	cfgPath := fs.String("config", defaultConfigPath(), "config file")
 	psk := fs.String("key", "", "enrollment PSK from `simplesiem certs psk show` on the server")
 	masterID := fs.String("id", "", "master ID (CN) to use; defaults to master-<hostname>")
+	// -y bypasses the realm-collector conflict prompt. Without -y the
+	// command asks for confirmation when the realm has a collector AND
+	// the master already has its own (the realm collector must yield).
+	yes := fs.Bool("y", false, "skip prompts (e.g. the realm-collector-will-be-demoted confirmation)")
 	_ = fs.Parse(args)
 	if fs.NArg() == 0 {
 		fatalf("usage: simplesiem master enroll <server-url> --key <PSK>")
@@ -716,8 +725,207 @@ func runMasterEnroll(args []string) {
 		}
 	}
 
+	// Realm-collector adoption / demote. Probe the just-enrolled
+	// server for its CollectorCN. If the realm has a collector:
+	//   - Master with no CollectorCN: auto-enable master's collector
+	//     listener (PKI + slot + PSK) and tell the server to forward
+	//     the PSK to its collector on the next /v1/sync/config tick;
+	//     the collector auto-promotes to the master.
+	//   - Master with a CollectorCN already taken: prompt (unless -y);
+	//     on confirmation the server tells its collector to demote
+	//     to a peer server in this realm. Single-collector-per-master
+	//     rule is preserved.
+	reconcileRealmCollectorOnEnroll(*cfgPath, res, *yes)
+
 	fmt.Println()
 	fmt.Println("Next: sudo simplesiem start  (or restart the master daemon)")
+}
+
+// reconcileRealmCollectorOnEnroll runs the "join a realm that has its
+// own collector" arbitration described in runMasterEnroll. Best-effort:
+// any probe or directive-send failure is reported but does not abort
+// the enrollment — the operator can re-run the relevant CLI on the
+// collector host manually.
+func reconcileRealmCollectorOnEnroll(cfgPath string, primary MasterEnrollResult, autoYes bool) {
+	tlsCfg, err := loadMasterClientTLS(primary.CertDir)
+	if err != nil {
+		fmt.Println()
+		fmt.Println("note: realm-collector probe skipped — could not load per-server client cert:", err)
+		return
+	}
+	tr := &http.Transport{TLSClientConfig: tlsCfg, TLSHandshakeTimeout: 10 * time.Second}
+	client := &http.Client{Transport: tr, Timeout: 20 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(primary.ServerURL, "/")+"/v1/sync/config", nil)
+	if err != nil {
+		return
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		fmt.Println()
+		fmt.Println("note: realm-collector probe skipped — /v1/sync/config not reachable:", err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		fmt.Println()
+		fmt.Printf("note: realm-collector probe got HTTP %d: %s\n", resp.StatusCode, strings.TrimSpace(string(buf)))
+		return
+	}
+	var pc map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&pc); err != nil {
+		return
+	}
+	collectorCN, _ := pc["collector_cn"].(string)
+	collectorCN = strings.TrimSpace(collectorCN)
+	if collectorCN == "" {
+		// Realm has no collector — nothing to reconcile.
+		return
+	}
+
+	cfg := loadConfig(cfgPath)
+	hadCollector := strings.TrimSpace(cfg.Master.CollectorCN) != ""
+
+	fmt.Println()
+	fmt.Printf("Realm %q has an existing collector (CN=%q).\n", primary.RealmName, collectorCN)
+	if !hadCollector {
+		fmt.Println("This master has no paired collector yet — adopting the realm collector.")
+		psk, listenAddr, perr := ensureMasterCollectorReadyForAdoption(cfgPath)
+		if perr != nil {
+			fmt.Println("  could not prepare master collector listener:", perr)
+			fmt.Println("  next steps:")
+			fmt.Println("    1. sudo simplesiem master collector enable --listen :9445")
+			fmt.Println("    2. sudo simplesiem master collector accept-next")
+			fmt.Println("    3. on the collector host: sudo simplesiem collector queue-promote --key <master PSK>")
+			return
+		}
+		masterURL := buildMasterCollectorURL(listenAddr)
+		if err := sendCollectorDirective(cfg, primary, CollectorDirectiveRequest{
+			MasterCollectorPSK: psk,
+			MasterURL:          masterURL,
+		}); err != nil {
+			fmt.Println("  could not deliver promote directive to server:", err)
+			fmt.Println("  the master's collector listener is enabled; on the collector host run:")
+			fmt.Println("    sudo simplesiem collector promote " + masterURL + " --key " + psk)
+			return
+		}
+		fmt.Println("  ✓ master collector listener enabled at", masterURL+";")
+		fmt.Println("    PSK forwarded to the realm collector via the server.")
+		fmt.Println("    The realm collector will auto-promote on its next /v1/sync/config poll (~5–60s).")
+		return
+	}
+
+	// Master already has a paired collector — the realm's existing
+	// collector must yield. Single-collector-per-master rule.
+	fmt.Println("This master already has its own paired collector — the realm collector must yield.")
+	fmt.Println("If you continue, the realm collector will be directed to convert to a server")
+	fmt.Println("(joining the realm as a peer; it stops being a collector).")
+	if !autoYes {
+		if !confirmYes("Continue? [y/N] ") {
+			fmt.Println("Aborted — no demote directive sent. Re-run with -y to skip this prompt.")
+			return
+		}
+	}
+	if err := sendCollectorDirective(cfg, primary, CollectorDirectiveRequest{DemoteToServer: true}); err != nil {
+		fmt.Println("  could not deliver demote directive:", err)
+		fmt.Println("  on the collector host run manually:")
+		fmt.Println("    sudo simplesiem convert standalone -y && sudo simplesiem convert server -y --realm " + primary.ServerURL + " --realm-key <PSK from any realm peer>")
+		return
+	}
+	fmt.Println("  ✓ demote directive forwarded to the realm collector via the server.")
+	fmt.Println("    The collector will surface a critical meta event with the exact follow-up commands.")
+}
+
+// ensureMasterCollectorReadyForAdoption flips on the master's collector
+// listener (bootstraps PKI + writes Master.CollectorListen / .Cert /
+// .Key / .CACert if unset), opens the single slot via the CollectorPendingEnroll
+// flag, and returns the PSK plus the listener address (e.g. ":9445")
+// the realm collector will dial during auto-promote. Idempotent —
+// safe to call when the listener is already on.
+func ensureMasterCollectorReadyForAdoption(cfgPath string) (string, string, error) {
+	allowlistEditMu.Lock()
+	cfg := loadConfig(cfgPath)
+	if cfg.Master.CollectorListen == "" {
+		cfg.Master.CollectorListen = ":9445"
+	}
+	listenAddr := cfg.Master.CollectorListen
+	if cfg.Master.CACert == "" {
+		certsDir := filepath.Join(filepath.Dir(cfgPath), "certs")
+		cfg.Master.CACert = filepath.Join(certsDir, "ca.pem")
+		cfg.Master.Cert = filepath.Join(certsDir, "server.pem")
+		cfg.Master.Key = filepath.Join(certsDir, "server.key")
+	}
+	if cfg.Master.CollectorEnrollPSKPath == "" {
+		cfg.Master.CollectorEnrollPSKPath = defaultMasterCollectorPSKPath()
+	}
+	cfg.Master.CollectorPendingEnroll = true
+	if err := saveConfig(cfgPath, cfg); err != nil {
+		allowlistEditMu.Unlock()
+		return "", "", fmt.Errorf("save config: %w", err)
+	}
+	allowlistEditMu.Unlock()
+	if _, _, err := ensureServerPKI(cfgPath, 10, 5); err != nil {
+		return "", "", fmt.Errorf("PKI bootstrap: %w", err)
+	}
+	psk, err := ensureMasterCollectorPSK(cfg.Master.CollectorEnrollPSKPath)
+	if err != nil {
+		return "", "", fmt.Errorf("create master collector PSK: %w", err)
+	}
+	return psk, listenAddr, nil
+}
+
+// buildMasterCollectorURL composes the URL a realm collector should use
+// to dial this master's collector listener. The host portion comes from
+// os.Hostname() so the URL is meaningful when seen by other hosts; if
+// the hostname doesn't resolve in the operator's DNS they can edit the
+// resulting `cfg.collector.source_url` manually or use `collector promote`
+// with the explicit URL.
+func buildMasterCollectorURL(listenAddr string) string {
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "master-host"
+	}
+	port := strings.TrimPrefix(listenAddr, ":")
+	if port == listenAddr {
+		// listen had explicit host like "10.0.0.1:9445" — extract port.
+		if i := strings.LastIndex(listenAddr, ":"); i >= 0 {
+			port = listenAddr[i+1:]
+		} else {
+			port = "9445"
+		}
+	}
+	return "https://" + host + ":" + port
+}
+
+// sendCollectorDirective POSTs a one-shot directive to a server's
+// /v1/master/collector-directive endpoint. The master has just-enrolled
+// with the server and holds a per-server client cert at primary.CertDir
+// — we use that for mTLS so the server recognises the caller's CN as
+// one in master_cns.
+func sendCollectorDirective(cfg Config, primary MasterEnrollResult, req CollectorDirectiveRequest) error {
+	_ = cfg // currently unused; reserved for future authority gates
+	tlsCfg, err := loadMasterClientTLS(primary.CertDir)
+	if err != nil {
+		return fmt.Errorf("load client cert: %w", err)
+	}
+	tr := &http.Transport{TLSClientConfig: tlsCfg, TLSHandshakeTimeout: 10 * time.Second}
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequest(http.MethodPost, strings.TrimRight(primary.ServerURL, "/")+"/v1/master/collector-directive", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(buf)))
+	}
+	return nil
 }
 
 // discoverAndAddRealmPeers queries the just-enrolled server's
